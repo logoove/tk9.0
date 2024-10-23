@@ -1,0 +1,90 @@
+License for Tcl/Tk documentation as copied from https://www.tcl.tk/man/tcl9.0/index.html
+-------------------------------------------------------------------------------
+
+Copyright © 1989-1994 The Regents of the University of California
+
+Copyright © 1992-1999 Karl Lehenbauer & Mark Diekhans
+
+Copyright © 1993-1997 Bell Labs Innovations for Lucent Technologies
+
+Copyright © 1993-1998 Lucent Technologies, Inc
+
+Copyright © 1994 The Australian National University
+
+Copyright © 1994-2000 Sun Microsystems, Inc
+
+Copyright © 1997-2000 Ajuba Solutions
+
+Copyright © 1997-2000 Scriptics Corporation
+
+Copyright © 1998 Mark Harrison
+
+Copyright © 2000 Jeffrey Hobbs
+
+Copyright © 2001 ActiveState Tool Corp
+
+Copyright © 2001 Vincent Darley
+
+Copyright © 2001-2004 ActiveState Corporation
+
+Copyright © 2001-2018 Kevin B. Kenny <kennykb(at)acm.org>
+
+Copyright © 2001-2023 Donal K. Fellows
+
+Copyright © 2002-2010 Andreas Kupries <andreas_kupries(at)users.sourceforge.net>
+
+Copyright © 2003 George Petasis <petasis(at)iit.demokritos.gr>
+
+Copyright © 2003 Simon Geard
+
+Copyright © 2003-2006 Joe English
+
+Copyright © 2005 Sergey Brester aka sebres
+
+Copyright © 2006 Miguel Sofer
+
+Copyright © 2006-2008 ActiveState Software Inc
+
+Copyright © 2006-2008 Daniel A. Steffen <das(at)users.sourceforge.net>
+
+Copyright © 2006-2008 Joe Mistachkin
+
+Copyright © 2008 Arnulf Wiedemann
+
+Copyright © 2008 Jos Decoster
+
+Copyright © 2008 Pat Thoyts
+
+Copyright © 2008 Peter Spjuth <pspjuth(at)users.sourceforge.net>
+
+Copyright © 2008-2010 Kevin B. Kenny
+
+Copyright © 2011 Kevin Walzer
+
+Copyright © 2011-2015 Andreas Kupries
+
+Copyright © 2012 Trevor Davel
+
+Copyright © 2015 Christian Werner <chw(at)ch-werner.de>
+
+Copyright © 2015 Jan Nijtmans <jan.nijtmans(at)gmail.com>
+
+Copyright © 2015-2017 Sean Woods <yoda(at)etoyoc.com>
+
+Copyright © 2017 Frederic Bonnet
+
+Copyright © 2018 Peter Spjuth
+
+Copyright © 2018 Tcl Core Team
+
+Copyright © 2018-2023 Nathan Coulter
+
+Copyright © 2019 Donal Fellows
+
+Copyright © 2020-2021 Kevin Walzer/WordTech Communications LLC
+
+Copyright © 2022 Ashok P. Nadkarni <apnmbx-public(at)yahoo.com>
+
+Copyright © 2022 Eric Taylor
+
+Copyright © 2022 Marc Culler
