@@ -20,35 +20,35 @@ all:
 	staticcheck 2>&1
 
 build_all_targets:
-	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build ./...
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build ./...
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -gcflags="github.com/ebitengine/purego/internal/fakecgo=-std"
+	GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -gcflags="github.com/ebitengine/purego/internal/fakecgo=-std" ./...
 	GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go test -o /dev/null -c -gcflags="github.com/ebitengine/purego/internal/fakecgo=-std"
-	GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 go build -gcflags="github.com/ebitengine/purego/internal/fakecgo=-std"
+	GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 go build -gcflags="github.com/ebitengine/purego/internal/fakecgo=-std" ./...
 	GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 go test -o /dev/null -c -gcflags="github.com/ebitengine/purego/internal/fakecgo=-std"
-	GOOS=linux GOARCH=386 CGO_ENABLED=0 go build
+	GOOS=linux GOARCH=386 CGO_ENABLED=0 go build ./...
 	GOOS=linux GOARCH=386 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=linux GOARCH=arm CGO_ENABLED=0 go build
+	GOOS=linux GOARCH=arm CGO_ENABLED=0 go build ./...
 	GOOS=linux GOARCH=arm CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=linux GOARCH=loong64 CGO_ENABLED=0 go build
+	GOOS=linux GOARCH=loong64 CGO_ENABLED=0 go build ./...
 	GOOS=linux GOARCH=loong64 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=linux GOARCH=ppc64le CGO_ENABLED=0 go build
+	GOOS=linux GOARCH=ppc64le CGO_ENABLED=0 go build ./...
 	GOOS=linux GOARCH=ppc64le CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=linux GOARCH=riscv64 CGO_ENABLED=0 go build
+	GOOS=linux GOARCH=riscv64 CGO_ENABLED=0 go build ./...
 	GOOS=linux GOARCH=riscv64 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=linux GOARCH=s390x CGO_ENABLED=0 go build
+	GOOS=linux GOARCH=s390x CGO_ENABLED=0 go build ./...
 	GOOS=linux GOARCH=s390x CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=windows GOARCH=386 CGO_ENABLED=0 go build
+	GOOS=windows GOARCH=386 CGO_ENABLED=0 go build ./...
 	GOOS=windows GOARCH=386 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -o /dev/null -c
-	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build
+	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build ./...
 	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go test -o /dev/null -c
 
 clean:
@@ -68,6 +68,8 @@ editor:
 	go run generator.go
 	gofmt -l -s -w .
 	go build -v  -o /dev/null
+	go build -v  -o /dev/null ./vnc
+	go build -v  -o /dev/null ./themes/azure
 	$(shell for f in _examples/*.go ; do go build -o /dev/null $$f ; done)
 
 test:

@@ -170,7 +170,7 @@ func eventDispatcher(data any, interp *tcl.Interp, argv []string) int {
 		return libtcl.TCL_ERROR
 	default:
 		interp.SetResult(e.Result)
-		return libtcl.TCL_OK
+		return e.returnCode
 	}
 }
 

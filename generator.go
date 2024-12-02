@@ -328,7 +328,7 @@ var (
 		},
 		"nsimage":    {ignore: true}, //TODO
 		"option":     {ignore: true},
-		"optionMenu": {manual: true}, //TODO
+		"optionMenu": {manual: true},
 		"options":    {ignore: true},
 		"pack": {
 			manual: true, // done
@@ -517,6 +517,7 @@ var (
 
 	hideOptMethods = map[string]bool{
 		"Textvariable": true,
+		"Variable":     true,
 	}
 
 	replaceOpt = map[string]string{

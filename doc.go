@@ -28,6 +28,16 @@
 // # In action
 //
 //   - [equ] A Plain TeX math editor.
+//   - [visualmd] A WYSIWYG markdown editor.
+//
+// # Frequently Asked Questions
+//
+//   - Windows: How to build an executable that doesn't open a console window when run?
+//
+//     From the [documentation for cmd/link]: On Windows, -H windowsgui writes
+//     a "GUI binary" instead of a "console binary.". To pass the flag to the
+//     Go build system use 'go build -ldflags -H=windowsgui somefile.go', for
+//     example.
 //
 // # Debugging
 //
@@ -151,6 +161,18 @@
 // three arguments can independently fail as well.  Checking each and one of
 // them separately is not always necessary in GUI code. But the explicit option
 // in the first example is still available when needed.
+//
+// # Themes
+//
+// There is a centralized theme register in [Themes]. Theme providers can opt
+// in to call [RegisterTheme] at package initialization to make themes
+// discoverable at run-time. Clients can use [ActivateTheme] to apply a theme
+// by name. Example in _examples/azure.go.
+//
+// # VNC server
+//
+// There is a VNC over wbesockets functionality available for X11 backed hosts.
+// See the [tk9.0/vnc package] for details.
 //
 // # Package initialization
 //
@@ -2353,11 +2375,14 @@
 // [MVP]: https://en.wikipedia.org/wiki/Minimum_viable_product
 // [RERO]: https://en.wikipedia.org/wiki/Release_early,_release_often
 // [Tkinter]: https://en.wikipedia.org/wiki/Tkinter
+// [documentation for cmd/link]: https://pkg.go.dev/cmd/link
 // [equ]: https://pkg.go.dev/modernc.org/equ
 // [issue tracker]: https://gitlab.com/cznic/tk9.0/-/issues
 // [jnml's LiberaPay]: https://liberapay.com/jnml/donate
 // [modern-c.appspot.com]: https://modern-c.appspot.com/-/builder/?importpath=modernc.org%2ftk9.0
 // [tcl.tk site]: https://www.tcl.tk/man/tcl9.0/TkCmd/index.html
+// [tk9.0/vnc package]: https://pkg.go.dev/modernc.org/tk9.0/vnc
 // [tkinter.ttk site]: https://docs.python.org/3/library/tkinter.ttk.html
 // [tutorialspoint]: https://www.tutorialspoint.com/tcl-tk/tk_overview.htm
+// [visualmd]: https://pkg.go.dev/modernc.org/visualmd
 package tk9_0 // import "modernc.org/tk9.0"

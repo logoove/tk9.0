@@ -46,7 +46,12 @@ const (
 	tcl_eval_direct = 0x40000
 	tcl_ok          = 0
 	tcl_error       = 1
-	tcl_result      = 2
+	tcl_return      = 2
+	tcl_break       = 3
+	tcl_continue    = 4
+
+	disconnectButtonTooltip = "Disconnect the application"
+	exitButtonTooltip       = "Quit the application"
 )
 
 // NativeScaling is the value returned by TKScaling in package initialization before it is possibly
@@ -73,12 +78,18 @@ var ErrorMode int
 var Error error
 
 var (
+	_ Opt    = (*MenuItem)(nil)
 	_ Widget = (*Window)(nil)
 
 	//go:embed embed/gotk.png
 	icon []byte
+	//go:embed embed/tklib/tooltip/tooltip.tcl
+	tooltip []byte
 
 	autocenterDisabled bool
+	appWithdrawn       bool
+	appIconified       bool
+	appDeiconified     bool
 	cleanupDirs        []string
 	exitHandler        Opt
 	finished           atomic.Int32
@@ -88,6 +99,7 @@ var (
 	id                 atomic.Int32
 	initialized        bool
 	isBuilder          = os.Getenv("MODERNC_BUILDER") != ""
+	isVNC              = os.Getenv("TK9_VNC") == "1"
 	wmTitle            string
 
 	// https://pdos.csail.mit.edu/archive/rover/RoverDoc/escape_shell_table.html
@@ -126,11 +138,12 @@ var (
 	//TODO remove the associated tcl var on window destroy event both from the
 	//interp and this map.
 	textVariables = map[*Window]string{} // : tclName
+	variables     = map[*Window]*VariableOpt{}
 	windowIndex   = map[string]*Window{}
 )
 
 func commonLazyInit() {
-	// Nothing yet.
+	eval(string(tooltip))
 }
 
 func checkSig(dir string, sig map[string]string) (r bool) {
@@ -256,7 +269,16 @@ func tclSafeInBraces(s string) string {
 func setDefaults() {
 	windowIndex[""] = App
 	windowIndex["."] = App
-	exitHandler = Command(func() { Destroy(App) })
+	if goos == "windows" {
+		wmWithdraw(App)
+	}
+	exitHandler = Command(func() {
+		Destroy(App)
+		for _, v := range Themes {
+			v.Deactivate(nil)
+			v.Finalize(nil)
+		}
+	})
 	evalErr("option add *tearOff 0") // https://tkdocs.com/tutorial/menus.html
 	NativeScaling = TkScaling()
 	if s := os.Getenv(ScaleEnvVar); s != "" {
@@ -313,13 +335,12 @@ type Window struct {
 func (w *Window) isWidget() {}
 
 // Widget is implemented by every *Window
+//
+// Widget implements Opt. When a Widget instance is used as an Opt, it provides
+// its path name.
 type Widget interface {
 	isWidget()
-	path() string
-}
-
-func (w *Window) path() (r string) {
-	return w.String()
+	optionString(*Window) string
 }
 
 // String implements fmt.Stringer.
@@ -334,16 +355,24 @@ func (w *Window) optionString(_ *Window) string {
 	return w.String()
 }
 
-func (w *Window) split(options []Opt) (opts []Opt, tvs []textVarOpt) {
+func (w *Window) split(options []Opt) (opts []Opt, tvs []textVarOpt, vs []*VariableOpt) {
 	for _, v := range options {
 		switch x := v.(type) {
 		case textVarOpt:
 			tvs = append(tvs, x)
+		case *VariableOpt:
+			vs = append(vs, x)
 		default:
 			opts = append(opts, x)
 		}
 	}
-	return opts, tvs
+	return opts, tvs, vs
+}
+
+func (w *Window) newChild0(nm string) (rw *Window) {
+	rw = &Window{fpath: fmt.Sprintf("%s.%s%v", w, nm, id.Add(1))}
+	windowIndex[rw.fpath] = rw
+	return rw
 }
 
 func (w *Window) newChild(nm string, options ...Opt) (rw *Window) {
@@ -353,7 +382,7 @@ func (w *Window) newChild(nm string, options ...Opt) (rw *Window) {
 		nm += "_"
 	}
 	path := fmt.Sprintf("%s.%s%v", w, nm, id.Add(1))
-	options, tvs := w.split(options)
+	options, tvs, vs := w.split(options)
 	rw = &Window{}
 	code := fmt.Sprintf("%s %s %s", class, path, winCollect(rw, options...))
 	var err error
@@ -362,6 +391,9 @@ func (w *Window) newChild(nm string, options ...Opt) (rw *Window) {
 	}
 	if len(tvs) != 0 {
 		rw.Configure(tvs[len(tvs)-1])
+	}
+	if len(vs) != 0 {
+		rw.Configure(vs[len(vs)-1])
 	}
 	windowIndex[rw.fpath] = rw
 	return rw
@@ -462,6 +494,8 @@ type Event struct {
 	// created.
 	W *Window
 
+	returnCode int // One of tcl_ok .. tcl_continue
+
 	// The window to which the event was reported (the window field from
 	// the event). Valid for all event types.  This field is set when the
 	// event is handled.
@@ -479,7 +513,7 @@ type Event struct {
 // Called from eventDispatcher. Arg1 is handler id, optionally followed by a
 // list of Bind substitution values.
 func newEvent(arg1 string) (id int, e *Event, err error) {
-	e = &Event{}
+	e = &Event{returnCode: tcl_ok}
 	a := strings.Fields(arg1)
 	if len(a) == 0 {
 		return -1, e, fmt.Errorf("internal error: missing handler ID")
@@ -502,6 +536,31 @@ func newEvent(arg1 string) (id int, e *Event, err error) {
 		}
 	}
 	return id, e, nil
+}
+
+// SetReturnCodeOK sets return code of 'e' to TCL_OK.
+func (e *Event) SetReturnCodeOK() {
+	e.returnCode = tcl_ok
+}
+
+// SetReturnCodeError sets return code of 'e' to TCL_ERROR.
+func (e *Event) SetReturnCodeError() {
+	e.returnCode = tcl_error
+}
+
+// SetReturnCodeReturn sets return code of 'e' to TCL_RETURN.
+func (e *Event) SetReturnCodeReturn() {
+	e.returnCode = tcl_return
+}
+
+// SetReturnCodeBreak sets return code of 'e' to TCL_BREAK.
+func (e *Event) SetReturnCodeBreak() {
+	e.returnCode = tcl_break
+}
+
+// SetReturnCodeContinue sets return code of 'e' to TCL_CONTINUE.
+func (e *Event) SetReturnCodeContinue() {
+	e.returnCode = tcl_continue
 }
 
 // ScrollSet communicates events to scrollbars. Example:
@@ -632,10 +691,14 @@ func optionString(v any) string {
 // assign an arbitrary set of binding tags to a window, the default binding
 // tags provide the following behavior:
 //
-//   - If a tag is the name of an internal window the binding applies to that window.
-//   - If the tag is the name of a class of widgets, such as Button, the binding applies to all widgets in that class.
-//   - If the tag is the name of a toplevel window the binding applies to the toplevel window and all its internal windows.
-//   - If tag has the value all, the binding applies to all windows in the application.
+//   - If a tag is the name of an internal window the binding applies to that
+//     window.
+//   - If the tag is the name of a class of widgets, such as Button, the
+//     binding applies to all widgets in that class.
+//   - If the tag is the name of a toplevel window the binding applies to the
+//     toplevel window and all its internal windows.
+//   - If tag has the value all, the binding applies to all windows in the
+//     application.
 //
 // Example usage in _examples/events.go.
 //
@@ -1075,6 +1138,23 @@ func Pack(options ...Opt) {
 	evalErr(fmt.Sprintf("pack %s", collect(options...)))
 }
 
+// SetResizable — Enable/disable window resizing
+//
+// # Description
+//
+// This command controls whether or not the user may interactively resize a
+// top-level window. If resizing is disabled, then the window's size will be
+// the size from the most recent interactive resize or wm geometry command. If
+// there has been no such operation then the window's natural size will be
+// used.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func (w *Window) SetResizable(width, height bool) {
+	evalErr(fmt.Sprintf("wm resizable %s %v %v", w, width, height))
+}
+
 // Wait — Wait for a window to be destroyed
 //
 // # Description
@@ -1090,12 +1170,22 @@ func Pack(options ...Opt) {
 func (w *Window) Wait() {
 	if w == App {
 		switch {
+		case os.Getenv("TK9_VNC") == "1":
+			autocenterDisabled = true
+			WmGeometry(App, fmt.Sprintf("%sx%s+0+0", os.Getenv("TK9_VNC_WIDTH"), os.Getenv("TK9_VNC_HEIGHT")))
 		case forcedX >= 0 && forcedY >= 0: // Behind TK9_DEMO=1.
 			evalErr(fmt.Sprintf("wm geometry . +%v+%v", forcedX, forcedY)) //TODO add API func
 			forcedX, forcedY = -1, -1                                      // Apply only the first time.
-		case !autocenterDisabled:
-			autocenterDisabled = true
-			w.Center()
+		default:
+			if goos == "windows" {
+				if !appWithdrawn && !appIconified {
+					WmDeiconify(App)
+				}
+			}
+			if autocenterDisabled {
+				autocenterDisabled = true
+				w.Center()
+			}
 		}
 	}
 	evalErr(fmt.Sprintf("tkwait window %s", w))
@@ -1374,7 +1464,7 @@ func GridColumnConfigure(w Widget, index int, options ...Opt) {
 
 // Configure alters the configuration of 'w' and returns 'w'.
 func (w *Window) Configure(options ...Opt) *Window {
-	options, tvs := w.split(options)
+	options, tvs, vs := w.split(options)
 	if len(options) != 0 {
 		evalErr(fmt.Sprintf("%s configure %s", w, collect(options...)))
 	}
@@ -1388,7 +1478,75 @@ func (w *Window) Configure(options ...Opt) *Window {
 		}
 		evalErr(fmt.Sprintf("set %s %s", tclVar, tclSafeString(string(tvo))))
 	}
+	if len(vs) != 0 {
+		vo := vs[len(vs)-1]
+		variables[w] = vo
+		if vo.tclName == "" {
+			vo.tclName = fmt.Sprintf("goVar%d", id.Add(1))
+		}
+		evalErr(fmt.Sprintf("%s configure -variable %s", w, vo.tclName))
+		evalErr(fmt.Sprintf("set %s %s", vo.tclName, tclSafeString(fmt.Sprint(vo.val))))
+	}
 	return w
+}
+
+// ttk::widget — Standard options and commands supported by Tk themed widgets
+//
+// # Description
+//
+// Modify or inquire widget state. If stateSpec is not "", sets the widget
+// state: for each flag in stateSpec, sets the corresponding flag or clears it
+// if prefixed by an exclamation point.  Returns a new state spec indicating
+// which flags were changed.
+//
+// If stateSpec is "", returns a list of the currently-enabled state flags.
+//
+// # Widget States
+//
+// The widget state is a bitmap of independent state flags. Widget state flags include:
+//
+//   - active:
+//     The mouse cursor is over the widget and pressing a mouse button will
+//     cause some action to occur. (aka “prelight” (Gnome), “hot” (Windows),
+//     “hover”).
+//   - disabled:
+//     Widget is disabled under program control (aka “unavailable”,
+//     “inactive”).
+//   - focus:
+//     Widget has keyboard focus.
+//   - pressed:
+//     Widget is being pressed (aka “armed” in Motif).
+//   - selected:
+//     “On”, “true”, or “current” for things like checkbuttons and
+//     radiobuttons.
+//   - background:
+//     Windows and the Mac have a notion of an “active” or foreground window.
+//     The background state is set for widgets in a background window, and
+//     cleared for those in the foreground window.
+//   - readonly:
+//     Widget should not allow user modification.
+//   - alternate:
+//     A widget-specific alternate display format. For example, used for
+//     checkbuttons and radiobuttons in the “tristate” or “mixed” state, and
+//     for buttons with -default active.
+//   - invalid:
+//     The widget's value is invalid. (Potential uses: scale widget value out
+//     of bounds, entry widget value failed validation.)
+//   - hover:
+//     The mouse cursor is within the widget. This is similar to the active
+//     state; it is used in some themes for widgets that provide distinct
+//     visual feedback for the active widget in addition to the active element
+//     within the widget.
+//   - user1-user6
+//     Freely usable for other purposes
+//
+// A state specification or stateSpec is a list of state names, optionally
+// prefixed with an exclamation point (!) indicating that the bit is off.
+func (w *Window) WidgetState(stateSpec string) (r string) {
+	if stateSpec != "" {
+		stateSpec = tclSafeString(stateSpec)
+	}
+	return evalErr(fmt.Sprintf("%s state %s", w, stateSpec))
 }
 
 // tk_messageBox — pops up a message window and waits for user response.
@@ -1713,8 +1871,21 @@ func ClipboardGet(options ...Opt) string {
 	return evalErr(fmt.Sprintf("clipboard get %s", collect(options...)))
 }
 
+var onceForceInit bool
+
+func forceInit() {
+	if onceForceInit {
+		return
+	}
+
+	defer func() { onceForceInit = true }()
+
+	evalErr("#")
+}
+
 // ExitHandler returns a canned [Command] that destroys the [App].
 func ExitHandler() Opt {
+	forceInit()
 	return exitHandler
 }
 
@@ -1731,7 +1902,12 @@ func Exit(options ...Opt) *ButtonWidget {
 //
 // The resulting [Window] is a child of 'w'
 func (w *Window) Exit(options ...Opt) *ButtonWidget {
-	return w.Button(append([]Opt{Txt("Exit"), ExitHandler()}, options...)...)
+	switch {
+	case isVNC:
+		return Tooltip(w.Button(append([]Opt{Txt("Disconnect"), ExitHandler()}, options...)...), disconnectButtonTooltip).(*ButtonWidget)
+	default:
+		return Tooltip(w.Button(append([]Opt{Txt("Exit"), ExitHandler()}, options...)...), exitButtonTooltip).(*ButtonWidget)
+	}
 }
 
 // TExit provides a canned [TButton] with default [Txt] "Exit", bound to the
@@ -1747,7 +1923,79 @@ func TExit(options ...Opt) *TButtonWidget {
 //
 // The resulting [Window] is a child of 'w'
 func (w *Window) TExit(options ...Opt) *TButtonWidget {
-	return w.TButton(append([]Opt{Txt("Exit"), ExitHandler()}, options...)...)
+	switch {
+	case isVNC:
+		return Tooltip(w.TButton(append([]Opt{Txt("Disconnect"), ExitHandler()}, options...)...), disconnectButtonTooltip).(*TButtonWidget)
+	default:
+		return Tooltip(w.TButton(append([]Opt{Txt("Exit"), ExitHandler()}, options...)...), exitButtonTooltip).(*TButtonWidget)
+	}
+}
+
+var _ Opt = (*VariableOpt)(nil)
+
+// VariableOpt is an Opt linking Go and Tcl variables.
+type VariableOpt struct {
+	tclName string
+	val     any
+}
+
+// Set sets the value of the linked Tcl variable.
+func (v *VariableOpt) Set(val any) {
+	if v == nil || v.tclName == "" {
+		fail(fmt.Errorf("%T not linked", v))
+		return
+	}
+
+	evalErr(fmt.Sprintf("set %s %s", v.tclName, tclSafeString(fmt.Sprint(val))))
+}
+
+// Get return the value of the linked Tcl variable.
+func (v *VariableOpt) Get() (r string) {
+	if v == nil || v.tclName == "" {
+		fail(fmt.Errorf("%T not linked", v))
+		return
+	}
+
+	return evalErr(fmt.Sprintf("set %s", v.tclName))
+}
+
+func (*VariableOpt) optionString(*Window) string {
+	panic("internal error") // Not supposed to be invoked.
+}
+
+// Variable option.
+//
+// Known uses:
+//   - [Checkbutton] (widget specific)
+//   - [MenuWidget.AddCascade] (command specific)
+//   - [MenuWidget.AddCommand] (command specific)
+//   - [MenuWidget.AddSeparator] (command specific)
+//   - [Radiobutton] (widget specific)
+//   - [Scale] (widget specific)
+//   - [TCheckbutton] (widget specific)
+//   - [TProgressbar] (widget specific)
+//   - [TRadiobutton] (widget specific)
+//   - [TScale] (widget specific)
+func Variable(val any) *VariableOpt {
+	return &VariableOpt{val: val}
+}
+
+// Variable — Get the configured option value.
+//
+// Known uses:
+//   - [Checkbutton] (widget specific)
+//   - [Radiobutton] (widget specific)
+//   - [Scale] (widget specific)
+//   - [TCheckbutton] (widget specific)
+//   - [TProgressbar] (widget specific)
+//   - [TRadiobutton] (widget specific)
+//   - [TScale] (widget specific)
+func (w *Window) Variable() string {
+	if tclVar := variables[w]; tclVar != nil {
+		return evalErr(fmt.Sprintf("set %s", tclVar.tclName))
+	}
+
+	return ""
 }
 
 type textVarOpt string
@@ -2295,6 +2543,395 @@ func (w *TextWidget) Insert(index any, chars string, options ...string) any {
 //
 // # Description
 //
+// This command associates a script with the tag given by tagName. Whenever the
+// event sequence given by sequence occurs for a character that has been tagged
+// with tagName, the script will be invoked. This widget command is similar to
+// the bind command except that it operates on characters in a text rather than
+// entire widgets. See the bind manual entry for complete details on the syntax
+// of sequence and the substitutions performed on script before invoking it.
+// A new binding is created, replacing any existing binding for the same sequence and tagName.
+// The only events for which
+// bindings may be specified are those related to the mouse and keyboard (such
+// as Enter, Leave, Button, Motion, and Key) or virtual events. Mouse and
+// keyboard event bindings for a text widget respectively use the current and
+// insert marks described under MARKS above. An Enter event triggers for a tag
+// when the tag first becomes present on the current character, and a Leave
+// event triggers for a tag when it ceases to be present on the current
+// character. Enter and Leave events can happen either because the current mark
+// moved or because the character at that position changed. Note that these
+// events are different than Enter and Leave events for windows. Mouse events
+// are directed to the current character, while keyboard events are directed to
+// the insert character. If a virtual event is used in a binding, that binding
+// can trigger only if the virtual event is defined by an underlying
+// mouse-related or keyboard-related event.
+//
+// It is possible for the current character to have multiple tags, and for each
+// of them to have a binding for a particular event sequence. When this occurs,
+// one binding is invoked for each tag, in order from lowest-priority to
+// highest priority. If there are multiple matching bindings for a single tag,
+// then the most specific binding is chosen (see the manual entry for the bind
+// command for details). continue and break commands within binding scripts are
+// processed in the same way as for bindings created with the bind command.
+//
+// If bindings are created for the widget as a whole using the bind command,
+// then those bindings will supplement the tag bindings. The tag bindings will
+// be invoked first, followed by bindings for the window as a whole.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) TagBind(tag, sequence string, handler any) string {
+	return evalErr(fmt.Sprintf("%s tag bind %s %s %s", w, tclSafeString(tag), tclSafeString(sequence), newEventHandler("", handler).optionString(w.Window)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Counts the number of relevant things between the two indices. If index1 is
+// after index2, the result will be a negative number (and this holds for each
+// of the possible options). The actual items which are counted depend on the
+// options given. The result is a list of integers, one for the result of each
+// counting option given. Valid counting options are -chars, -displaychars,
+// -displayindices, -displaylines, -indices, -lines, -xpixels and -ypixels. The
+// default value, if no option is specified, is -indices. There is an
+// additional possible option -update which is a modifier. If given (and if the
+// text widget is managed by a geometry manager), then all subsequent options
+// ensure that any possible out of date information is recalculated. This
+// currently only has any effect for the -ypixels count (which, if -update is
+// not given, will use the text widget's current cached value for each line).
+// This -update option is obsoleted by pathName sync, pathName pendingsync and
+// <<WidgetViewSync>>. The count options are interpreted as follows:
+//
+//   - [Chars] Count all characters, whether elided or not. Do not count
+//     embedded windows or images.
+//   - [Displaychars] Count all non-elided characters.
+//   - [Displayindices] Count all non-elided characters, windows and images.
+//   - [Displaylines] Count all display lines (i.e. counting one for each time
+//     a line wraps) from the line of the first index up to, but not including
+//     the display line of the second index. Therefore if they are both on the
+//     same display line, zero will be returned. By definition displaylines are
+//     visible and therefore this only counts portions of actual visible lines.
+//   - [Indices] Count all characters and embedded windows or images (i.e.
+//     everything which counts in text-widget index space), whether they are
+//     elided or not.
+//   - [Lines] Count all logical lines (irrespective of wrapping) from the line
+//     of the first index up to, but not including the line of the second index.
+//     Therefore if they are both on the same line, zero will be returned.
+//     Logical lines are counted whether they are currently visible (non-elided)
+//     or not.
+//   - [Xpixels] Count the number of horizontal pixels from the first pixel of
+//     the first index to (but not including) the first pixel of the second
+//     index. To count the total desired width of the text widget (assuming
+//     wrapping is not enabled), first find the longest line and then use “.text
+//     count -xpixels "${line}.0" "${line}.0 lineend"”.
+//   - [Ypixels] Count the number of vertical pixels from the first pixel of
+//     the first index to (but not including) the first pixel of the second
+//     index. If both indices are on the same display line, zero will be
+//     returned. To count the total number of vertical pixels in the text widget,
+//     use “.text count -ypixels 1.0 end”, and to ensure this is up to date, use
+//     “.text count -update -ypixels 1.0 end”.
+//
+// The command returns a positive or negative integer corresponding to the
+// number of items counted between the two indices. One such integer is
+// returned for each counting option given, so a list is returned if more than
+// one option was supplied. For example “.text count -xpixels -ypixels 1.3 4.5”
+// is perfectly valid and will return a list of two elements.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) Count(options ...any) []string {
+	return parseList(evalErr(fmt.Sprintf("%s count %s", w, collectAny(options...))))
+}
+
+// Displayindices option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Displayindices() Opt {
+	return rawOption("-displayindices")
+}
+
+// Displaylines option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Displaylines() Opt {
+	return rawOption("-displaylines")
+}
+
+// Indices option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Indices() Opt {
+	return rawOption("-indices")
+}
+
+// Lines option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Lines() Opt {
+	return rawOption("-lines")
+}
+
+// Xpixels option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Xpixels() Opt {
+	return rawOption("-xpixels")
+}
+
+// Ypixels option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Ypixels() Opt {
+	return rawOption("-ypixels")
+}
+
+// Chars option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Chars() Opt {
+	return rawOption("-chars")
+}
+
+// Displaychars option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Displaychars() Opt {
+	return rawOption("-displaychars")
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Clears the undo and redo stacks.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) EditReset() {
+	evalErr(fmt.Sprintf("%s edit reset", w))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Sets the modified flag of the widget to 'v'.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) SetModified(v bool) {
+	evalErr(fmt.Sprintf("%s edit modified %v", w, v))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Returns the modified flag of the widget. The insert, delete, edit undo and
+// edit redo commands or the user can set or clear the modified flag.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) Modified() bool {
+	return tclBool(evalErr(fmt.Sprintf("%s edit modified", w)))
+}
+
+func tclBool(s string) bool {
+	switch s {
+	case "1", "true", "yes":
+		return true
+	case "0", "false", "no":
+		return false
+	default:
+		fail(fmt.Errorf("unexpected Tcl bool: %q", s))
+		return false
+	}
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Returns a list whose elements are the names of all the tags that are active
+// at the character position given by index. If index is omitted, then the
+// return value will describe all of the tags that exist for the text (this
+// includes all tags that have been named in a “pathName tag” widget command
+// but have not been deleted by a “pathName tag delete” widget command, even if
+// no characters are currently marked with the tag). The list will be sorted in
+// order from lowest priority to highest priority.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) TagNames(index string) []string {
+	if index != "" {
+		index = tclSafeString(index)
+	}
+	return parseList(evalErr(fmt.Sprintf("%s tag names %s", w, index)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// If direction is not specified, returns left or right to indicate which of
+// its adjacent characters markName is attached to. If direction is specified,
+// it must be left or right; the gravity of markName is set to the given value.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) MarkGravity(markName, direction string) {
+	evalErr(fmt.Sprintf("%s mark gravity %s %s", w, tclSafeString(markName), tclSafeString(direction)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Sets the mark named markName to a position just before the character at
+// index. If markName already exists, it is moved from its old position; if it
+// does not exist, a new mark is created. This command returns an empty string.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) MarkSet(markName string, index any) {
+	evalErr(fmt.Sprintf("%s mark set %s %s", w, tclSafeString(markName), tclSafeString(fmt.Sprint(index))))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Remove the mark corresponding to each of the markName arguments. The removed
+// marks will not be usable in indices and will not be returned by future calls
+// to “pathName mark names”. This command returns an empty string.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) MarkUnset(markName ...string) {
+	evalErr(fmt.Sprintf("%s mark unset %s", w, tclSafeStrings(markName...)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Returns a list whose elements are the names of all the marks that are
+// currently set.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) MarkNames() []string {
+	return parseList(evalErr(fmt.Sprintf("%s mark names", w)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Searches the text in pathName starting at index for a range of characters
+// that matches pattern. If a match is found, the index of the first character
+// in the match is returned as result; otherwise an empty string is returned.
+// One or more of the following switches (or abbreviations thereof) may be
+// specified to control the search:
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) Search(options ...any) string {
+	var switches Opts
+	var args []any
+	for _, v := range options {
+		switch x := v.(type) {
+		case Opt:
+			switches = append(switches, x)
+		default:
+			args = append(args, v)
+		}
+	}
+	return evalErr(fmt.Sprintf("%s search %s %s", w, collect(switches...), tclSafeList(args...)))
+}
+
+// Forward option.
+//
+// Known uses:
+//   - [Text] (widget specific, applies to Search)
+func Forward() Opt {
+	return rawOption(fmt.Sprintf(`-forward`))
+}
+
+// Backward option.
+//
+// Known uses:
+//   - [Text] (widget specific, applies to Search)
+func Backward() Opt {
+	return rawOption(fmt.Sprintf(`-backward`))
+}
+
+// Regexp option.
+//
+// Known uses:
+//   - [Text] (widget specific, applies to Search)
+func Regexp() Opt {
+	return rawOption(fmt.Sprintf(`-regexp`))
+}
+
+// Nocase option.
+//
+// Known uses:
+//   - [Text] (widget specific, applies to Search)
+func Nocase() Opt {
+	return rawOption(fmt.Sprintf(`-nocase`))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Deletes all tag information for each of the tagName arguments. The command
+// removes the tags from all characters in the file and also deletes any other
+// information associated with the tags, such as bindings and display
+// information. The command returns an empty string.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) TagDelete(tags ...string) {
+	evalErr(fmt.Sprintf("%s tag delete %s", w, tclSafeStrings(tags...)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Clear makes 'w' empty.
+func (w *TextWidget) Clear() {
+	w.Delete("0.0", "end")
+	w.TagDelete(w.TagNames("")...)
+	w.MarkUnset(w.MarkNames()...)
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
 // Copies the selection in the widget to the clipboard, if there is a selection.
 //
 // Additional information might be available at the [Tcl/Tk text] page.
@@ -2413,6 +3050,50 @@ func (lc LC) String() string {
 //
 // # Description
 //
+// This command creates a new image annotation, which will appear in the text
+// at the position given by index. Any number of option-value pairs may be
+// specified to configure the annotation. Returns a unique identifier that may
+// be used as an index to refer to this image. See EMBEDDED IMAGES for
+// information on the options that are supported, and a description of the
+// identifier returned.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) ImageCreate(index any, options ...Opt) {
+	idx := fmt.Sprint(index)
+	evalErr(fmt.Sprintf("%s image create %s %s", w, tclSafeString(idx), collect(options...)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// This command creates a new window annotation, which will appear in the text
+// at the position given by index. Any number of option-value pairs may be
+// specified to configure the annotation. See EMBEDDED WINDOWS for information
+// on the options that are supported. Returns an empty string.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) WindowCreate(index any, options ...Opt) {
+	idx := fmt.Sprint(index)
+	evalErr(fmt.Sprintf("%s window create %s %s", w, tclSafeString(idx), collect(options...)))
+}
+
+// Win option.
+//
+// Known uses:
+//   - [Text] (widget specific, applies to embedded windows)
+func Win(val any) Opt {
+	return rawOption(fmt.Sprintf(`-window %s`, optionString(val)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
 // Returns a list containing two elements, both of which are real fractions
 // between 0 and 1. The first element gives the position of the first visible
 // pixel of the first character (or image, etc) in the top line in the window,
@@ -2427,6 +3108,78 @@ func (lc LC) String() string {
 // [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
 func (w *TextWidget) Yview() string {
 	return evalErr(fmt.Sprintf("%s yview", w))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Adjusts the view in the window so that the pixel given by fraction appears
+// at the top of the top line of the window. Fraction is a fraction between 0
+// and 1; 0 indicates the first pixel of the first character in the text, 0.33
+// indicates the pixel that is one-third the way through the text; and so on.
+// Values close to 1 will indicate values close to the last pixel in the text
+// (1 actually refers to one pixel beyond the last pixel), but in such cases
+// the widget will never scroll beyond the last pixel, and so a value of 1 will
+// effectively be rounded back to whatever fraction ensures the last pixel is
+// at the bottom of the window, and some other pixel is at the top.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) Yviewmoveto(fraction any) string {
+	return evalErr(fmt.Sprintf("%s yview moveto %s", w, tclSafeString(fmt.Sprint(fraction))))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Adjusts the view in the window so that the character given by index is
+// completely visible. If index is already visible then the command does
+// nothing. If index is a short distance out of view, the command adjusts the
+// view just enough to make index visible at the edge of the window. If index
+// is far out of view, then the command centers index in the window.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) See(index any) {
+	evalErr(fmt.Sprintf("%s see %s", w, tclSafeString(fmt.Sprint(index))))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Returns a list describing all of the ranges of text that have been tagged
+// with tagName. The first two elements of the list describe the first tagged
+// range in the text, the next two elements describe the second range, and so
+// on. The first element of each pair contains the index of the first character
+// of the range, and the second element of the pair contains the index of the
+// character just after the last one in the range. If there are no characters
+// tagged with tag then an empty string is returned.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) TagRanges(tagName string) (r []string) {
+	return parseList(evalErr(fmt.Sprintf("%s tag ranges %s", w, tclSafeString(tagName))))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Returns the position corresponding to index in the form line.char where line
+// is the line number and char is the character number. Index may have any of
+// the forms described under INDICES above.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) Index(index any) (r string) {
+	return evalErr(fmt.Sprintf("%s index %s", w, tclSafeString(fmt.Sprint(index))))
 }
 
 // Text — Create and manipulate 'text' hypertext editing widgets
@@ -2469,8 +3222,17 @@ func (w *TextWidget) Xview() string {
 // Additional information might be available at the [Tcl/Tk text] page.
 //
 // [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
-func (w *TextWidget) TagConfigure(name string, options ...Opt) {
-	evalErr(fmt.Sprintf("%s tag configure %s %s", w, tclSafeString(name), collect(options...)))
+func (w *TextWidget) TagConfigure(tagName string, options ...Opt) {
+	evalErr(fmt.Sprintf("%s tag configure %s %s", w, tclSafeString(tagName), collect(options...)))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Select all text in 'w'.
+func (w *TextWidget) SelectAll() {
+	evalErr(fmt.Sprintf("%s tag add sel 1.0 end", w))
 }
 
 // Text — Create and manipulate 'text' hypertext editing widgets
@@ -2505,6 +3267,37 @@ func (w *TextWidget) TagAdd(options ...any) string {
 	}
 	evalErr(fmt.Sprintf("%s tag add %s %s", w, tag, collect(a...)))
 	return tag
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Delete a range of characters from the text. If both index1 and index2 are
+// specified, then delete all the characters starting with the one given by
+// index1 and stopping just before index2 (i.e. the character at index2 is not
+// deleted). If index2 does not specify a position later in the text than
+// index1 then no characters are deleted. If index2 is not specified then the
+// single character at index1 is deleted. Attempts to delete characters in a
+// way that would leave the text without a newline as the last character will
+// be tweaked by the text widget to avoid this. In particular, deletion of
+// complete lines of text up to the end of the text will also delete the
+// newline character just before the deleted block so that it is replaced by
+// the new final newline of the text widget. The command returns an empty
+// string. If more indices are given, multiple ranges of text will be deleted.
+// All indices are first checked for validity before any deletions are made.
+// They are sorted and the text is removed from the last range to the first
+// range so deleted text does not cause an undesired index shifting
+// side-effects. If multiple ranges with the same start index are given, then
+// the longest range is used. If overlapping ranges are given, then they will
+// be merged into spans that do not cause deletion of text outside the given
+// ranges due to text shifted during deletion.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) Delete(options ...any) {
+	evalErr(fmt.Sprintf("%s delete %s", w, collectAny(options...)))
 }
 
 // Text — Create and manipulate 'text' hypertext editing widgets
@@ -2871,8 +3664,13 @@ func FontchooserHide() {
 // Additional information might be available at the [Tcl/Tk getopenfile] page.
 //
 // [Tcl/Tk getopenfile]: https://www.tcl.tk/man/tcl9.0/TkCmd/getOpenFile.html
-func GetOpenFile(options ...Opt) []string {
-	return parseList(evalErr(fmt.Sprintf("tk_getOpenFile %s", collect(options...))))
+func GetOpenFile(options ...Opt) (r []string) {
+	switch s := evalErr(fmt.Sprintf("tk_getOpenFile %s", collect(options...))); {
+	case strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}"):
+		return parseList(s)
+	default:
+		return []string{s}
+	}
 }
 
 // FileType specifies a single file type for the [Filetypes] option.
@@ -3109,7 +3907,7 @@ func Place(options ...Opt) {
 func (w *Window) Lower(belowThis Widget) {
 	b := ""
 	if belowThis != nil {
-		b = belowThis.path()
+		b = belowThis.optionString(nil)
 	}
 	evalErr(fmt.Sprintf("lower %s %s", w, b))
 }
@@ -3139,7 +3937,7 @@ func (w *Window) Lower(belowThis Widget) {
 func (w *Window) Raise(aboveThis Widget) {
 	b := ""
 	if aboveThis != nil {
-		b = aboveThis.path()
+		b = aboveThis.optionString(nil)
 	}
 	evalErr(fmt.Sprintf("raise %s %s", w, b))
 }
@@ -3182,6 +3980,50 @@ func gnuplot(script string) (out []byte, err error) {
 	return exec.CommandContext(ctx, "gnuplot", f.Name()).Output()
 }
 
+// MenuItem represents an entry on a menu.
+type MenuItem struct {
+	id string
+}
+
+// String implements fmt.Stringer.
+func (m *MenuItem) String() string {
+	return m.optionString(nil)
+}
+
+func (m *MenuItem) optionString(_ *Window) string {
+	if m != nil {
+		return m.id
+	}
+
+	return "mnu_non_existing"
+}
+
+// Menu — Create and manipulate 'menu' widgets and menubars
+//
+// # Description
+//
+// Add a new radiobutton entry to the bottom of the menu.
+//
+// Additional information might be available at the [Tcl/Tk menu] page.
+//
+// [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
+func (w *MenuWidget) AddRadiobutton(options ...Opt) *MenuItem {
+	return &MenuItem{id: evalErr(fmt.Sprintf("%s add radiobutton %s", w, winCollect(w.Window, options...)))}
+}
+
+// Menu — Create and manipulate 'menu' widgets and menubars
+//
+// # Description
+//
+// Add a new checkbutton entry to the bottom of the menu.
+//
+// Additional information might be available at the [Tcl/Tk menu] page.
+//
+// [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
+func (w *MenuWidget) AddCheckbutton(options ...Opt) *MenuItem {
+	return &MenuItem{id: evalErr(fmt.Sprintf("%s add checkbutton %s", w, winCollect(w.Window, options...)))}
+}
+
 // Menu — Create and manipulate 'menu' widgets and menubars
 //
 // # Description
@@ -3191,8 +4033,8 @@ func gnuplot(script string) (out []byte, err error) {
 // Additional information might be available at the [Tcl/Tk menu] page.
 //
 // [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
-func (w *MenuWidget) AddCommand(options ...Opt) {
-	evalErr(fmt.Sprintf("%s add command %s", w, winCollect(w.Window, options...)))
+func (w *MenuWidget) AddCommand(options ...Opt) *MenuItem {
+	return &MenuItem{id: evalErr(fmt.Sprintf("%s add command %s", w, winCollect(w.Window, options...)))}
 }
 
 // Menu — Create and manipulate 'menu' widgets and menubars
@@ -3204,8 +4046,8 @@ func (w *MenuWidget) AddCommand(options ...Opt) {
 // Additional information might be available at the [Tcl/Tk menu] page.
 //
 // [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
-func (w *MenuWidget) AddCascade(options ...Opt) {
-	evalErr(fmt.Sprintf("%s add cascade %s", w, winCollect(w.Window, options...)))
+func (w *MenuWidget) AddCascade(options ...Opt) *MenuItem {
+	return &MenuItem{id: evalErr(fmt.Sprintf("%s add cascade %s", w, winCollect(w.Window, options...)))}
 }
 
 // Menu — Create and manipulate 'menu' widgets and menubars
@@ -3217,8 +4059,8 @@ func (w *MenuWidget) AddCascade(options ...Opt) {
 // Additional information might be available at the [Tcl/Tk menu] page.
 //
 // [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
-func (w *MenuWidget) AddSeparator(options ...Opt) {
-	evalErr(fmt.Sprintf("%s add separator %s", w, winCollect(w.Window, options...)))
+func (w *MenuWidget) AddSeparator(options ...Opt) *MenuItem {
+	return &MenuItem{id: evalErr(fmt.Sprintf("%s add separator %s", w, winCollect(w.Window, options...)))}
 }
 
 // Menu — Create and manipulate 'menu' widgets and menubars
@@ -3238,6 +4080,26 @@ func (w *MenuWidget) AddSeparator(options ...Opt) {
 // [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
 func (w *MenuWidget) Invoke(index uint) {
 	evalErr(fmt.Sprintf("%s invoke %d", w, index))
+}
+
+// Menu — Create and manipulate 'menu' widgets and menubars
+//
+// # Description
+//
+// This command is similar to the configure command, except that it applies to
+// the options for an individual entry, whereas configure applies to the
+// options for the menu as a whole. Options may have any of the values
+// described in the MENU ENTRY OPTIONS section below. If options are specified,
+// options are modified as indicated in the command and the command returns an
+// empty string. If no options are specified, returns a list describing the
+// current options for entry index (see Tk_ConfigureInfo for information on the
+// format of this list).
+//
+// Additional information might be available at the [Tcl/Tk menu] page.
+//
+// [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
+func (w *MenuWidget) EntryConfigure(index uint, options ...Opt) {
+	evalErr(fmt.Sprintf("%s entryconfigure %d %s", w, index, winCollect(w.Window, options...)))
 }
 
 // TScrollbar — Control the viewport of a scrollable widget
@@ -3863,11 +4725,40 @@ func StyleThemeUse(themeName ...string) string {
 
 // CourierFont returns "{courier new}" on Windows and "courier" elsewhere.
 func CourierFont() string {
-	if runtime.GOOS == "windows" {
+	if goos == "windows" {
 		return "courier new"
 	}
 
 	return "courier"
+}
+
+// button — Create and manipulate 'button' action widgets
+//
+// # Description
+//
+// Invoke the Tcl command associated with the button, if there is one. The
+// return value is the return value from the Tcl command, or an empty string if
+// there is no command associated with the button. This command is ignored if
+// the button's state is disabled.
+//
+// Additional information might be available at the [Tcl/Tk button] page.
+//
+// [Tcl/Tk button]: https://www.tcl.tk/man/tcl9.0/TkCmd/button.html
+func (w *ButtonWidget) Invoke() string {
+	return evalErr(fmt.Sprintf("%s invoke", w))
+}
+
+// TButton — Widget that issues a command when pressed
+//
+// # Description
+//
+// Invokes the command associated with the button.
+//
+// Additional information might be available at the [Tcl/Tk ttk::button] page.
+//
+// [Tcl/Tk ttk::button]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_button.html
+func (w *TButtonWidget) Invoke() string {
+	return evalErr(fmt.Sprintf("%s invoke", w))
 }
 
 // TButton — Widget that issues a command when pressed
@@ -4043,6 +4934,7 @@ func Tabmargins(val any) Opt {
 // Tabposition — Styling widgets
 //
 // Tabposition is a styling option of a ttk::notebook.
+//
 // More information might be available at the [Tcl/Tk ttk_notebook] page.
 //
 // [Tcl/Tk ttk_notebook]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_notebook.html
@@ -4058,6 +4950,93 @@ func Tabposition(val any) Opt {
 // [Changing Widget Colors]: https://wiki.tcl-lang.org/page/Changing+Widget+Colors
 func Sashthickness(val any) Opt {
 	return rawOption(fmt.Sprintf(`-sashthickness %s`, optionString(val)))
+}
+
+// panedwindow — Create and manipulate 'panedwindow' split container widgets
+//
+// # Description
+//
+// Add one or more windows to the panedwindow, each in a separate pane. The
+// arguments consist of the names of one or more windows followed by pairs of
+// arguments that specify how to manage the windows. Option may have any of the
+// values accepted by the configure subcommand.
+//
+// More information might be available at the [Tcl/Tk panedwindow] page.
+//
+// [Tcl/Tk panedwindow]: https://www.tcl.tk/man/tcl9.0/TkCmd/panedwindow.html
+func (w *PanedwindowWidget) Add(subwindow *Window, options ...Opt) {
+	evalErr(fmt.Sprintf("%s add %s %s", w, subwindow, collect(options...)))
+}
+
+// panedwindow — Create and manipulate 'panedwindow' split container widgets
+//
+// # Description
+//
+// Query or modify the management options for window. If no option is
+// specified, returns a list describing all of the available options for
+// pathName (see Tk_ConfigureInfo for information on the format of this list).
+// If option is specified with no value, then the command returns a list
+// describing the one named option (this list will be identical to the
+// corresponding sublist of the value returned if no option is specified). If
+// one or more option-value pairs are specified, then the command modifies the
+// given widget option(s) to have the given value(s); in this case the command
+// returns an empty string.
+//
+// More information might be available at the [Tcl/Tk panedwindow] page.
+//
+// [Tcl/Tk panedwindow]: https://www.tcl.tk/man/tcl9.0/TkCmd/panedwindow.html
+func (w *PanedwindowWidget) Paneconfigure(subwindow *Window, options ...Opt) string {
+	return evalErr(fmt.Sprintf("%s paneconfigure %s %s", w, subwindow, collect(options...)))
+}
+
+// Stretch option.
+//
+// # Description
+//
+// Controls how extra space is allocated to each of the panes. When is one of
+// always, first, last, middle, and never. The panedwindow will calculate the
+// required size of all its panes. Any remaining (or deficit) space will be
+// distributed to those panes marked for stretching. The space will be
+// distributed based on each panes current ratio of the whole. The when values
+// have the following definition:
+//
+//   - always: This pane will always stretch.
+//   - first: Only if this pane is the first pane (left-most or top-most) will it stretch.
+//   - last: Only if this pane is the last pane (right-most or bottom-most) will it stretch. This is the default value.
+//   - middle: Only if this pane is not the first or last pane will it stretch.
+//   - never: This pane will never stretch.
+//
+// Known uses:
+//   - [PanedwindowWidget] (command specific)
+func Stretch(when string) Opt {
+	return rawOption(fmt.Sprintf(`-stretch %s`, tclSafeString(when)))
+}
+
+// panedwindow — Create and manipulate 'panedwindow' split container widgets
+//
+// # Description
+//
+// Query a management option for window. Option may be any value allowed by the
+// paneconfigure subcommand.
+//
+// More information might be available at the [Tcl/Tk panedwindow] page.
+//
+// [Tcl/Tk panedwindow]: https://www.tcl.tk/man/tcl9.0/TkCmd/panedwindow.html
+func (w *PanedwindowWidget) Panecget(subwindow *Window, opt any) string {
+	return evalErr(fmt.Sprintf("%s panecget %s %s", w, subwindow, funcToTclOption(opt)))
+}
+
+// ttk::panedwindow — Multi-pane container window
+//
+// # Description
+//
+// Adds a new pane to the window. See PANE OPTIONS for the list of available options.
+//
+// More information might be available at the [Tcl/Tk ttk_panedwindow] page.
+//
+// [Tcl/Tk ttk_panedwindow]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_panedwindow.html
+func (w *TPanedwindowWidget) Add(subwindow *Window, options ...Opt) {
+	evalErr(fmt.Sprintf("%s add %s %s", w, subwindow, collect(options...)))
 }
 
 // Gripsize — Styling widgets
@@ -4186,6 +5165,182 @@ func Indicatorsize(val any) Opt {
 //
 // # Description
 //
+// This command is used to manage window manager protocols. The name argument
+// in the wm protocol command is the name of an atom corresponding to a window
+// manager protocol. Examples include WM_DELETE_WINDOW or WM_SAVE_YOURSELF or
+// WM_TAKE_FOCUS.  A window manager protocol is a class of messages sent from a
+// window manager to a Tk application outside of the normal event processing
+// system. The main example is the WM_DELETE_WINDOW protocol; these messages
+// are sent when the user clicks the close widget in the title bar of a window.
+// Handlers for window manager protocols are installed with the wm protocol
+// command. As a rule, if no handler has been installed for a protocol by the
+// wm protocol command then all messages of that protocol are ignored. The
+// WM_DELETE_WINDOW protocol is an exception to this rule. At start-up Tk
+// installs a handler for this protocol, which responds by destroying the
+// window. The wm protocol command can be used to replace this default handler
+// by one which responds differently.
+//
+// The list of available window manager protocols depends on the window
+// manager, but all window managers supported by Tk provide WM_DELETE_WINDOW.
+// On the Windows platform, a WM_SAVE_YOURSELF message is sent on user logout
+// or system restart.
+//
+// If both name and command are specified, then command becomes the handler for
+// the protocol specified by name. The atom for name will be added to window's
+// WM_PROTOCOLS property to tell the window manager that the application has a
+// handler for the protocol specified by name, and command will be invoked in
+// the future whenever the window manager sends a message of that protocol to
+// the Tk application. In this case the wm protocol command returns an empty
+// string. If name is specified but command is not (is nil), then the current
+// handler for name is returned, or an empty string if there is no handler
+// defined for name (as a special case, the default handler for
+// WM_DELETE_WINDOW is not returned). If command is specified as an empty
+// string then the atom for name is removed from the WM_PROTOCOLS property of
+// window and the handler is destroyed; an empty string is returned. Lastly, if
+// neither name nor command is specified, the wm protocol command returns a
+// list of all of the protocols for which handlers are currently defined for
+// window.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func WmProtocol(w *Window, name string, command any) string {
+	switch {
+	case command == nil:
+		return evalErr(fmt.Sprintf("wm protocol %s %s", w, tclSafeString(name)))
+	case command == "":
+		return evalErr(fmt.Sprintf("wm protocol %s %s {}", w, tclSafeString(name)))
+	default:
+		return evalErr(fmt.Sprintf("wm protocol %s %s %s", w, tclSafeString(name), newEventHandler("", command).optionString(w)))
+	}
+}
+
+// wm — Communicate with window manager
+//
+// # Description
+//
+// Arrange for window to be iconified. It window has not yet been mapped for
+// the first time, this command will arrange for it to appear in the iconified
+// state when it is eventually mapped.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func WmIconify(w *Window) {
+	if w == App {
+		appIconified = true
+		appDeiconified = false
+	}
+	wmIconify(w)
+}
+
+func wmIconify(w *Window) {
+	evalErr(fmt.Sprintf("wm iconify %s", w))
+}
+
+// wm — Communicate with window manager
+//
+// # Description
+//
+// Arrange for window to be displayed in normal (non-iconified) form. This is
+// done by mapping the window. If the window has never been mapped then this
+// command will not map the window, but it will ensure that when the window is
+// first mapped it will be displayed in de-iconified form. On Windows, a
+// deiconified window will also be raised and be given the focus (made the
+// active window). Returns an empty string.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func WmDeiconify(w *Window) {
+	if w == App {
+		appDeiconified = true
+		appIconified = false
+	}
+	wmDeiconify(w)
+}
+
+func wmDeiconify(w *Window) {
+	evalErr(fmt.Sprintf("wm deiconify %s", w))
+}
+
+// wm — Communicate with window manager
+//
+// # Description
+//
+// Arranges for window to be withdrawn from the screen. This causes the window
+// to be unmapped and forgotten about by the window manager. If the window has
+// never been mapped, then this command causes the window to be mapped in the
+// withdrawn state. Not all window managers appear to know how to handle
+// windows that are mapped in the withdrawn state. Note that it sometimes seems
+// to be necessary to withdraw a window and then re-map it (e.g. with wm
+// deiconify) to get some window managers to pay attention to changes in window
+// attributes such as group.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func WmWithdraw(w *Window) {
+	if w == App {
+		appWithdrawn = true
+	}
+	wmWithdraw(w)
+}
+
+func wmWithdraw(w *Window) {
+	evalErr(fmt.Sprintf("wm withdraw %s", w))
+}
+
+// wm — Communicate with window manager
+//
+// # Description
+//
+// If newGeometry is specified, then the geometry of window is changed and an
+// empty string is returned. Otherwise the current geometry for window is
+// returned (this is the most recent geometry specified either by manual
+// resizing or in a wm geometry command). NewGeometry has the form
+// =widthxheight±x±y, where any of =, widthxheight, or ±x±y may be omitted.
+// Width and height are positive integers specifying the desired dimensions of
+// window. If window is gridded (see GRIDDED GEOMETRY MANAGEMENT below) then
+// the dimensions are specified in grid units; otherwise they are specified in
+// pixel units.
+//
+// X and y specify the desired location of window on the screen, in pixels. If
+// x is preceded by +, it specifies the number of pixels between the left edge
+// of the screen and the left edge of window's border; if preceded by - then x
+// specifies the number of pixels between the right edge of the screen and the
+// right edge of window's border. If y is preceded by + then it specifies the
+// number of pixels between the top of the screen and the top of window's
+// border; if y is preceded by - then it specifies the number of pixels between
+// the bottom of window's border and the bottom of the screen.
+//
+// If newGeometry is specified as an empty string then any existing
+// user-specified geometry for window is cancelled, and the window will revert
+// to the size requested internally by its widgets.
+//
+// Note that this is related to winfo geometry, but not the same. That can only
+// query the geometry, and always reflects Tk's current understanding of the
+// actual size and location of window, whereas wm geometry allows both setting
+// and querying of the window manager's understanding of the size and location
+// of the window. This can vary significantly, for example to reflect the
+// addition of decorative elements to window such as title bars, and window
+// managers are not required to precisely follow the requests made through this
+// command.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func WmGeometry(w *Window, geometry string) string {
+	if w == App {
+		autocenterDisabled = true
+	}
+	return evalErr(fmt.Sprintf("wm geometry %s %s", w, tclSafeString(geometry)))
+}
+
+// wm — Communicate with window manager
+//
+// # Description
+//
 // Width and height give the maximum permissible
 // dimensions for window. For gridded windows the dimensions are specified in
 // grid units; otherwise they are specified in pixel units. The window manager
@@ -4232,6 +5387,31 @@ func WmMaxSize(w *Window) (width, height int) {
 	return width, height
 }
 
+// wm — Communicate with window manager
+//
+// # Description
+//
+// If width and height are specified, they give the minimum permissible
+// dimensions for window. For gridded windows the dimensions are specified in
+// grid units; otherwise they are specified in pixel units. The window manager
+// will restrict the window's dimensions to be greater than or equal to width
+// and height. If width and height are specified, then the command returns an
+// empty string. Otherwise it returns a Tcl list with two elements, which are
+// the minimum width and height currently in effect. The minimum size defaults
+// to one pixel in each dimension. See the sections on geometry management
+// below for more information.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func WmMinSize(w *Window, widthHeight ...any) (r string) {
+	arg := ""
+	if len(widthHeight) >= 2 {
+		arg = fmt.Sprintf("%s %s", tclSafeString(fmt.Sprint(widthHeight[0])), tclSafeString(fmt.Sprint(widthHeight[1])))
+	}
+	return evalErr(fmt.Sprintf("wm minsize %s %s", w, arg))
+}
+
 // Initalize enforces the parts of package initialization that are otherwise
 // done lazily. The function may panic if ErrorMode is PanicOnError.
 func Initialize() {
@@ -4265,7 +5445,11 @@ func (w *TNotebookWidget) Add(options ...Opt) {
 //
 // [Tcl/Tk TNotebook]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_notebook.html
 func (w *TNotebookWidget) Select(tabid any) string {
-	return evalErr(fmt.Sprintf("%s select %s", w, tclSafeString(fmt.Sprint(tabid))))
+	var arg string
+	if tabid != nil && tabid != "" {
+		arg = tclSafeString(fmt.Sprint(tabid))
+	}
+	return evalErr(fmt.Sprintf("%s select %s", w, arg))
 }
 
 // TNotebook — Multi-paned container widget
@@ -4439,6 +5623,24 @@ func (w *CheckbuttonWidget) Select() {
 //
 // # Description
 //
+// Does just what would have happened if the user invoked the checkbutton with
+// the mouse: toggle the selection state of the button and invoke the Tcl
+// command associated with the checkbutton, if there is one. The return value
+// is the return value from the Tcl command, or an empty string if there is no
+// command associated with the checkbutton. This command is ignored if the
+// checkbutton's state is disabled.
+//
+// More information might be available at the [Tcl/Tk checkbutton] page.
+//
+// [Tcl/Tk checkbutton]: https://www.tcl.tk/man/tcl9.0/TkCmd/checkbutton.html
+func (w *CheckbuttonWidget) Invoke() string {
+	return evalErr(fmt.Sprintf("%s invoke", w))
+}
+
+// checkbutton — Create and manipulate 'checkbutton' boolean selection widgets
+//
+// # Description
+//
 // Deselects the checkbutton and sets the associated variable to its “off” value.
 //
 // More information might be available at the [Tcl/Tk checkbutton] page.
@@ -4513,4 +5715,546 @@ func Data(val any) Opt {
 		}
 	}
 	return rawOption(fmt.Sprintf(`-data %s`, optionString(val)))
+}
+
+// winfo — Return window-related information
+//
+// # Description
+//
+// Returns a decimal string giving the height of window's screen, in pixels.
+//
+// More information might be available at the [Tcl/Tk winfo] page.
+//
+// [Tcl/Tk winfo]: https://www.tcl.tk/man/tcl9.0/TkCmd/winfo.html
+func WinfoScreenHeight(w *Window) string {
+	return evalErr(fmt.Sprintf("winfo screenheight %s", w))
+}
+
+// winfo — Return window-related information
+//
+// # Description
+//
+// Returns a decimal string giving the width of window's screen, in pixels.
+//
+// More information might be available at the [Tcl/Tk winfo] page.
+//
+// [Tcl/Tk winfo]: https://www.tcl.tk/man/tcl9.0/TkCmd/winfo.html
+func WinfoScreenWidth(w *Window) string {
+	return evalErr(fmt.Sprintf("winfo screenwidth %s", w))
+}
+
+// winfo — Return window-related information
+//
+// # Description
+//
+// Returns a decimal string giving window's height in pixels. When a window is
+// first created its height will be 1 pixel; the height will eventually be
+// changed by a geometry manager to fulfil the window's needs. If you need the
+// true height immediately after creating a widget, invoke update to force the
+// geometry manager to arrange it, or use winfo reqheight to get the window's
+// requested height instead of its actual height.
+//
+// More information might be available at the [Tcl/Tk winfo] page.
+//
+// [Tcl/Tk winfo]: https://www.tcl.tk/man/tcl9.0/TkCmd/winfo.html
+func WinfoHeight(w *Window) string {
+	return evalErr(fmt.Sprintf("winfo height %s", w))
+}
+
+// winfo — Return window-related information
+//
+// # Description
+//
+// Returns a decimal string giving window's width in pixels. When a window is
+// first created its width will be 1 pixel; the width will eventually be
+// changed by a geometry manager to fulfil the window's needs. If you need the
+// true width immediately after creating a widget, invoke update to force the
+// geometry manager to arrange it, or use winfo reqwidth to get the window's
+// requested width instead of its actual width.
+//
+// More information might be available at the [Tcl/Tk winfo] page.
+//
+// [Tcl/Tk winfo]: https://www.tcl.tk/man/tcl9.0/TkCmd/winfo.html
+func WinfoWidth(w *Window) string {
+	return evalErr(fmt.Sprintf("winfo width %s", w))
+}
+
+// tooltip — Tooltip management
+//
+// # Description
+//
+// Prevents the specified widgets from showing tooltips. pattern is a glob
+// pattern and defaults to matching all widgets.
+//
+// More information might be available at the [Tklib tooltip] page.
+//
+// [Tklib tooltip]: https://core.tcl-lang.org/tklib/doc/trunk/embedded/md/tklib/files/modules/tooltip/tooltip.md
+func TooltipClear(pattern string) {
+	s := ""
+	if pattern != "" {
+		s = tclSafeString(pattern)
+	}
+	evalErr(fmt.Sprintf("tooltip::tooltip clear %s", s))
+}
+
+// tooltip — Tooltip management
+//
+// # Description
+//
+// Queries or modifies the configuration options of the tooltip. The supported
+// options are -backgroud, -foreground and -font. If one option is specified with
+// no value, returns the value of that option. Otherwise, sets the given
+// options to the corresponding values.
+//
+// More information might be available at the [Tklib tooltip] page.
+//
+// [Tklib tooltip]: https://core.tcl-lang.org/tklib/doc/trunk/embedded/md/tklib/files/modules/tooltip/tooltip.md
+func TooltipConfigure(options ...any) string {
+	return evalErr(fmt.Sprintf("tooltip::tooltip configure %s", collectAny(options)))
+}
+
+// tooltip — Tooltip management
+//
+// # Description
+//
+// Query or set the hover delay. This is the interval that the pointer must
+// remain over the widget before the tooltip is displayed. The delay is
+// specified in milliseconds and must be greater than or equal to 50 ms. With
+// a negative argument the current delay is returned.
+//
+// More information might be available at the [Tklib tooltip] page.
+//
+// [Tklib tooltip]: https://core.tcl-lang.org/tklib/doc/trunk/embedded/md/tklib/files/modules/tooltip/tooltip.md
+func TooltipDelay(delay time.Duration) string {
+	s := ""
+	if delay >= 0 {
+		s = optionString(delay)
+	}
+	return evalErr(fmt.Sprintf("tooltip::tooltip delay %s", s))
+}
+
+// tooltip — Tooltip management
+//
+// # Description
+//
+// Enable or disable fading of the tooltip. The fading is enabled by default on
+// Win32 and Aqua. The tooltip will fade away on Leave events instead
+// disappearing.
+//
+// More information might be available at the [Tklib tooltip] page.
+//
+// [Tklib tooltip]: https://core.tcl-lang.org/tklib/doc/trunk/embedded/md/tklib/files/modules/tooltip/tooltip.md
+func TooltipFade(v bool) string {
+	return evalErr(fmt.Sprintf("tooltip::tooltip fade %v", v))
+}
+
+// tooltip — Tooltip management
+//
+// # Description
+//
+// # Disable all tooltips
+//
+// More information might be available at the [Tklib tooltip] page.
+//
+// [Tklib tooltip]: https://core.tcl-lang.org/tklib/doc/trunk/embedded/md/tklib/files/modules/tooltip/tooltip.md
+func TooltipOff(v bool) string {
+	return evalErr("tooltip::tooltip off")
+}
+
+// tooltip — Tooltip management
+//
+// # Description
+//
+// Enables tooltips for defined widgets.
+//
+// More information might be available at the [Tklib tooltip] page.
+//
+// [Tklib tooltip]: https://core.tcl-lang.org/tklib/doc/trunk/embedded/md/tklib/files/modules/tooltip/tooltip.md
+func TooltipOn(v bool) string {
+	return evalErr("tooltip::tooltip on")
+}
+
+// tooltip — Tooltip management
+//
+// # Description
+//
+// This command arranges for widget 'w' to display a tooltip with a
+// message.
+//
+// If the specified widget is a menu, canvas, listbox, ttk::treeview,
+// ttk::notebook or text widget then additional options are used to tie the
+// tooltip to specific menu, canvas or listbox items, ttk::treeview items or
+// column headings, ttk::notebook tabs, or text widget tags.
+//
+//   - [Heading] columnId: This option is used to set a tooltip for a
+//     ttk::treeview column heading. The column does not need to already exist.
+//     You should not use the same identifiers for columns and items in a widget
+//     for which you are using tooltips as their tooltips will be mixed. The
+//     widget must be a ttk::treeview widget.
+//
+//   - [Image] image: The specified (photo) image will be displayed to the left
+//     of the primary tooltip message.
+//
+//   - [Index] index: This option is used to set a tooltip on a menu item. The
+//     index may be either the entry index or the entry label. The widget must be
+//     a menu widget but the entries do not have to exist when the tooltip is
+//     set.
+//
+//   - [Info] info: The specified info text will be displayed as additional
+//     information below the primary tooltip message.
+//
+//   - [Items] items: This option is used to set a tooltip for canvas, listbox
+//     or ttk::treview items. For the canvas widget, the item must already be
+//     present in the canvas and will be found with a find withtag lookup. For
+//     listbox and ttk::treview widgets the item(s) may be created later but the
+//     programmer is responsible for managing the link between the listbox or
+//     ttk::treview item index and the corresponding tooltip. If the listbox or
+//     ttk::treview items are re-ordered, the tooltips will need amending.
+//
+//     If the widget is not a canvas, listbox or ttk::treview then an error is
+//     raised.
+//
+//   - [Tab] tabId: The -tab option can be used to set a tooltip for a
+//     ttk::notebook tab. The tab should already be present when this command is
+//     called, or an error will be returned. The widget must be a ttk::notebook
+//     widget.
+//
+//   - [Tag] name: The -tag option can be used to set a tooltip for a text
+//     widget tag. The tag should already be present when this command is called,
+//     or an error will be returned. The widget must be a text widget.
+//
+//   - "--": The -- option marks the end of options. The argument following
+//     this one will be treated as message even if it starts with a -.
+//
+// Tooltip returns 'w'.
+//
+// More information might be available at the [Tklib tooltip] page.
+//
+// [Tklib tooltip]: https://core.tcl-lang.org/tklib/doc/trunk/embedded/md/tklib/files/modules/tooltip/tooltip.md
+func Tooltip(w Widget, options ...any) (r Widget) {
+	evalErr(fmt.Sprintf("tooltip::tooltip %s %s", w, collectAny(options...)))
+	return w
+}
+
+// Heading option.
+//
+// Known uses:
+//   - [Tooltip] (command specific)
+func Heading(columnId string) Opt {
+	return rawOption(fmt.Sprintf(`-heading %s`, optionString(columnId)))
+}
+
+// Index option.
+//
+// Known uses:
+//   - [Tooltip] (command specific)
+func Index(index any) Opt {
+	return rawOption(fmt.Sprintf(`-index %s`, optionString(index)))
+}
+
+// Info option.
+//
+// Known uses:
+//   - [Tooltip] (command specific)
+func Info(info string) Opt {
+	return rawOption(fmt.Sprintf(`-info %s`, optionString(info)))
+}
+
+// Items option.
+//
+// Known uses:
+//   - [Tooltip] (command specific)
+func Items(items ...any) Opt {
+	return rawOption(fmt.Sprintf(`-items %s`, collectAny(items...)))
+}
+
+// Tab option.
+//
+// Known uses:
+//   - [Tooltip] (command specific)
+func Tab(tabId any) Opt {
+	return rawOption(fmt.Sprintf(`-tab %s`, collectAny(tabId)))
+}
+
+// Tag option.
+//
+// Known uses:
+//   - [Tooltip] (command specific)
+func Tag(name string) Opt {
+	return rawOption(fmt.Sprintf(`-tag %s`, optionString(name)))
+}
+
+// ttk::combobox — text field with popdown selection list
+//
+// # Description
+//
+// If newIndex is supplied, sets the combobox value to the element at position
+// newIndex in the list of -values (in addition to integers, the end index is
+// supported and indicates the last element of the list, moreover the same
+// simple interpretation as for the command string index is supported, with
+// simple integer index arithmetic and indexing relative to end). Otherwise,
+// returns the index of the current value in the list of -values or {} if the
+// current value does not appear in the list.
+//
+// More information might be available at the [Tcl/Tk combobox] page.
+//
+// [Tcl/Tk combobox]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_combobox.html
+func (w *TComboboxWidget) Current(newIndex any) (r string) {
+	var arg string
+	if newIndex != nil {
+		arg = tclSafeString(fmt.Sprint(newIndex))
+	}
+	return evalErr(fmt.Sprintf("%s current %s", w, arg))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Query or modify the options for the specified column. If no -option is
+// specified, returns a dictionary of option/value pairs. If a single -option
+// is specified, returns the value of that option. Otherwise, the options are
+// updated with the specified values. The following options may be set on each
+// column:
+//
+//   - id name:
+//     The column name. This is a read-only option. For example, [$pathname
+//     column #n -id] returns the data column associated with display column n.
+//     The tree column has -id #0.
+//   - anchor anchor:
+//     Specifies how the text in this column should be aligned with respect to
+//     the cell. Anchor is one of n, ne, e, se, s, sw, w, nw, or center.
+//   - minwidth minwidth:
+//     The minimum width of the column in pixels. The treeview widget will not
+//     make the column any smaller than -minwidth when the widget is resized or
+//     the user drags a heading column separator. Default is 20 pixels.
+//   - separator boolean:
+//     Specifies whether or not a column separator should be drawn to the right
+//     of the column. Default is false.
+//   - stretch boolean:
+//     Specifies whether or not the column width should be adjusted when the
+//     widget is resized or the user drags a heading column separator. Boolean
+//     may have any of the forms accepted by Tcl_GetBoolean. By default columns
+//     are stretchable.
+//     -width width:
+//     The width of the column in pixels. Default is 200 pixels. The specified
+//     column width may be changed by Tk in order to honor -stretch and/or
+//     -minwidth, or when the widget is resized or the user drags a heading
+//     column separator.
+//
+// Use pathname "#0" to configure the tree column.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Column(column any, options ...Opt) (r string) {
+	return evalErr(fmt.Sprintf("%s column %s %s", w, tclSafeString(fmt.Sprint(column)), collect(options...)))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Query or modify the heading options for the specified column. Valid options
+// are:
+//
+//   - text text:
+//     The text to display in the column heading.
+//   - image imageName:
+//     Specifies an image to display to the right of the column heading.
+//   - anchor anchor:
+//     Specifies how the heading text should be aligned. One of the standard Tk anchor values.
+//   - command script:
+//     A script to evaluate when the heading label is pressed.
+//
+// Use pathname heading "#0" to configure the tree column heading.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Heading(column any, options ...Opt) (r string) {
+	return evalErr(fmt.Sprintf("%s heading %s %s", w, tclSafeString(fmt.Sprint(column)), collect(options...)))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Creates a new item. parent is the item ID of the parent item, or the empty
+// string {} to create a new top-level item. index is an integer, or the value
+// end, specifying where in the list of parent's children to insert the new
+// item. If index is negative or zero, the new node is inserted at the
+// beginning; if index is greater than or equal to the current number of
+// children, it is inserted at the end. If -id is specified, it is used as the
+// item identifier; id must not already exist in the tree. Otherwise, a new
+// unique identifier is generated.
+//
+// Insert returns the item identifier of the newly created item. See
+// ITEM OPTIONS for the list of available options.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Insert(parent, index any, options ...Opt) (r string) {
+	return evalErr(fmt.Sprintf("%s insert %s %s %s", w, tclSafeString(fmt.Sprint(parent)), tclSafeString(fmt.Sprint(index)), collect(options...)))
+}
+
+// Id option.
+//
+// Known uses:
+//   - [TTreeviewWidget] (command specific)
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func Id(val any) Opt {
+	return rawOption(fmt.Sprintf(`-id %s`, optionString(val)))
+}
+
+// Open option.
+//
+// Known uses:
+//   - [TTreeviewWidget] (command specific)
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func Open(val bool) Opt {
+	return rawOption(fmt.Sprintf(`-open %v`, val))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Query or modify the options for the specified item. If no -option is
+// specified, returns a dictionary of option/value pairs. If a single -option
+// is specified, returns the value of that option. Otherwise, the item's
+// options are updated with the specified values. See ITEM OPTIONS for the list
+// of available options.  pathname move item parent index
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Item(item any, options ...Opt) (r string) {
+	return evalErr(fmt.Sprintf("%s item %s %s", w, tclSafeString(fmt.Sprint(item)), collect(options...)))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Manages item selection. Item selection is independent from cell selection
+// handled by the cellselection command. If selop is not specified, returns the
+// list of selected items. Otherwise, selop is one of the following:
+//
+//   - set itemList:
+//     itemList becomes the new selection.
+//   - add itemList:
+//     Add itemList to the selection.
+//   - remove itemList:
+//     Remove itemList from the selection.
+//   - toggle itemList:
+//     Toggle the selection state of each item in itemList.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Selection(selop string, itemList ...any) (r []string) {
+	if selop == "" {
+		return parseList(evalErr(fmt.Sprintf("%s selection %s %s", w, tclSafeString(fmt.Sprint(selop)), collectAny(itemList...))))
+	}
+
+	evalErr(fmt.Sprintf("%s selection %s %s", w, tclSafeString(fmt.Sprint(selop)), collectAny(itemList...)))
+	return nil
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Ensure that item is visible: sets all of item's ancestors to -open true, and
+// scrolls the widget if necessary so that item is within the visible portion
+// of the tree.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) See(item any) {
+	evalErr(fmt.Sprintf("%s see %s", w, tclSafeString(fmt.Sprint(item))))
+}
+
+// ttk::scale — Create and manipulate a scale widget
+//
+// # Description
+//
+// Get the current value of the -value option, or the value corresponding to
+// the coordinates x,y if they are specified. X and y are pixel coordinates
+// relative to the scale widget origin.
+//
+// More information might be available at the [Tcl/Tk scale] page.
+//
+// [Tcl/Tk scale]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_scale.html
+func (w *TScaleWidget) Get(xy ...any) (r string) {
+	arg := ""
+	if len(xy) >= 2 {
+		arg = fmt.Sprintf("%s %s", tclSafeString(fmt.Sprint(xy[0])), tclSafeString(fmt.Sprint(xy[1])))
+	}
+	return evalErr(fmt.Sprintf("%s get %s", w, arg))
+}
+
+// tk_optionMenu — Create an option menubutton and its menu
+//
+// # Description
+//
+// This procedure creates an option menubutton whose name is pathName, plus an
+// associated menu. Together they allow the user to select one of the values
+// given by the value arguments. The current value will be stored in the global
+// variable whose name is given by varName and it will also be displayed as the
+// label in the option menubutton. The user can click on the menubutton to
+// display a menu containing all of the values and thereby select a new value.
+// Once a new value is selected, it will be stored in the variable and appear
+// in the option menubutton. The current value can also be changed by setting
+// the variable.
+//
+// The return value from tk_optionMenu is the name of the menu associated with
+// pathName, so that the caller can change its configuration options or
+// manipulate it in other ways.
+//
+// More information might be available at the [Tcl/Tk option menu] page.
+//
+// [Tcl/Tk option menu]: https://tcl.tk/man/tcl9.0/TkCmd/optionMenu.html
+func OptionMenu(varName *VariableOpt, options ...any) (r *OptionMenuWidget) {
+	return App.OptionMenu(varName, options...)
+}
+
+// tk_optionMenu — Create an option menubutton and its menu
+//
+// The resulting [Widget] is a child of 'w'
+//
+// For details please see [Button]
+func (w *Window) OptionMenu(varName *VariableOpt, options ...any) (r *OptionMenuWidget) {
+	r = &OptionMenuWidget{Window: w.newChild0("optionmenu")}
+	for i, v := range options {
+		if s := fmt.Sprint(v); s == "" {
+			options[i] = "{}"
+		}
+	}
+	r.name = evalErr(fmt.Sprintf("tk_optionMenu %s %s %s", r, varName.tclName, tclSafeList(options...)))
+	return r
+}
+
+// OptionMenuWidget represents the Tcl/Tk option menu.
+//
+// More information might be available at the [Tcl/Tk option menu] page.
+//
+// [Tcl/Tk option menu]: https://tcl.tk/man/tcl9.0/TkCmd/optionMenu.html
+type OptionMenuWidget struct {
+	*Window
+	name string
+}
+
+// Name returns the menu name of 'w'.
+func (w *OptionMenuWidget) Name() string {
+	return w.name
 }

@@ -288,7 +288,7 @@ func eval(code string) (r string, err error) {
 	defer allocator.UintptrFree(cs)
 
 	switch r0, _, _ := evalExProc.Call(interp, cs, uintptr(len(code)), tcl_eval_direct); r0 {
-	case tcl_ok, tcl_result:
+	case tcl_ok, tcl_return:
 		return tclResult(), nil
 	default:
 		return "", fmt.Errorf("%s", tclResult())
@@ -322,7 +322,7 @@ func eventDispatcher(clientData, in uintptr, argc int32, argv uintptr) uintptr {
 			return tcl_error
 		}
 
-		return tcl_ok
+		return uintptr(e.returnCode)
 	}
 }
 

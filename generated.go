@@ -1200,7 +1200,7 @@ type ListboxWidget struct {
 // the other entries will number starting at 1.  The default menu
 // bindings arrange for the menu to be torn off when the tear-off entry
 // is invoked.
-// This option is ignored under Aqua/MacOS, where menus cannot
+// This option is ignored under Aqua/macOS, where menus cannot
 // be torn off.
 //
 // [Tearoffcommand]
@@ -1214,7 +1214,7 @@ type ListboxWidget struct {
 // and menu .x.y is torn off to
 // create a new menu .x.tearoff1, then the command
 // will be invoked.
-// This option is ignored under Aqua/MacOS, where menus cannot
+// This option is ignored under Aqua/macOS, where menus cannot
 // be torn off.
 //
 // [Title]
@@ -8558,37 +8558,6 @@ func Values(val any) Opt {
 //   - [TSpinbox] (widget specific)
 func (w *Window) Values() string {
 	return evalErr(fmt.Sprintf(`%s cget -values`, w))
-}
-
-// Variable option.
-//
-// Known uses:
-//   - [Checkbutton] (widget specific)
-//   - [MenuWidget.AddCascade] (command specific)
-//   - [MenuWidget.AddCommand] (command specific)
-//   - [MenuWidget.AddSeparator] (command specific)
-//   - [Radiobutton] (widget specific)
-//   - [Scale] (widget specific)
-//   - [TCheckbutton] (widget specific)
-//   - [TProgressbar] (widget specific)
-//   - [TRadiobutton] (widget specific)
-//   - [TScale] (widget specific)
-func Variable(val any) Opt {
-	return rawOption(fmt.Sprintf(`-variable %s`, optionString(val)))
-}
-
-// Variable — Get the configured option value.
-//
-// Known uses:
-//   - [Checkbutton] (widget specific)
-//   - [Radiobutton] (widget specific)
-//   - [Scale] (widget specific)
-//   - [TCheckbutton] (widget specific)
-//   - [TProgressbar] (widget specific)
-//   - [TRadiobutton] (widget specific)
-//   - [TScale] (widget specific)
-func (w *Window) Variable() string {
-	return evalErr(fmt.Sprintf(`%s cget -variable`, w))
 }
 
 // Visual option.
