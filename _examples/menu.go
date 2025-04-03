@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	. "modernc.org/tk9.0"
+	_ "modernc.org/tk9.0/themes/azure"
 	"runtime"
 )
 
@@ -37,5 +38,6 @@ func main() {
 	menubar.AddCascade(Lbl("Help"), Underline(0), Mnu(helpMenu))
 
 	App.WmTitle(fmt.Sprintf("%s on %s", App.WmTitle(""), runtime.GOOS))
+	ActivateTheme("azure light")
 	App.Configure(Mnu(menubar), Width("8c"), Height("6c")).Wait()
 }

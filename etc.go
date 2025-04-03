@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -66,8 +67,24 @@ func trc(s string, args ...interface{}) string {
 	default:
 		s = fmt.Sprintf(s, args...)
 	}
-	r := fmt.Sprintf("%s: TRC %s", origin(2), s)
+	r := fmt.Sprintf("%s: TRC(id=%v) %s", origin(2), goroutineID(), s)
 	fmt.Fprintf(os.Stderr, "%s\n", r)
 	os.Stderr.Sync()
 	return r
+}
+
+func goroutineID() int {
+	var (
+		buf [64]byte
+		n   = runtime.Stack(buf[:], false)
+		stk = strings.TrimPrefix(string(buf[:n]), "goroutine")
+	)
+
+	idField := strings.Fields(stk)[0]
+	id, err := strconv.Atoi(idField)
+	if err != nil {
+		panic(fmt.Errorf("can not get goroutine id: %v", err))
+	}
+
+	return id
 }

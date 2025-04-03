@@ -26,8 +26,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mileusna/useragent"
 	"modernc.org/mathutil"
 	"modernc.org/opt"
+	"modernc.org/tk9.0"
 )
 
 func init() {
@@ -35,12 +37,32 @@ func init() {
 }
 
 const (
+	// ScaleEnvVarMobile, if a valid (floating point) number, overrides the
+	// TK9_SCALE value for mobile clients.
+	ScaleEnvVarMobile = "TK9_VNC_SCALE_MOBILE"
+
+	// EnvVarVNC is non-blank when app runs via VNC.
+	EnvVarVNC = "TK9_VNC"
+
+	// EnvVarMobile is non-blank when a mobile client connects.
+	EnvVarMobile = "TK9_VNC_MOBILE"
+
+	// EnvVarInstanceStart is set to the unix milliseconds when the client instance
+	// started.
+	EnvVarInstanceStart = "TK9_VNC_INSTANCE_START"
+
+	// EnvVarInstanceStat is set to the unix milliseconds of the client instance
+	// stat mtime.
+	EnvVarInstanceStat = "TK9_VNC_INSTANCE_STAT"
+
 	// defaultlMaxXServerNumber is the default value of MaxXServerNumber.
 	defaultlMaxXServerNumber = 75
 	// defaultPort is the default value of the -vnc.port CLI flag
 	defaultPort = 1221
 
 	depth = 16 // Xvfb screen depth
+
+	scaleEnvVar = tk9_0.ScaleEnvVar
 )
 
 // maxXServerNumber limits the number X servers in [1..maxXServerNumber]
@@ -110,11 +132,11 @@ func allocDisplay() (r int, err error) {
 	return 0, fmt.Errorf("cannot find free X server number")
 }
 
-func (f *flags) start(bin string, args []string, pipe bool) (cmd *exec.Cmd, cancel context.CancelFunc, stdout io.ReadCloser, err error) {
-	return f.start0(bin, args, pipe, false)
+func (f *flags) start(bin string, args []string, pipe bool, env map[string]string) (cmd *exec.Cmd, cancel context.CancelFunc, stdout io.ReadCloser, err error) {
+	return f.start0(bin, args, pipe, false, env)
 }
 
-func (f *flags) start0(bin string, args []string, pipe, silent bool) (cmd *exec.Cmd, cancel context.CancelFunc, stdout io.ReadCloser, err error) {
+func (f *flags) start0(bin string, args []string, pipe, silent bool, env map[string]string) (cmd *exec.Cmd, cancel context.CancelFunc, stdout io.ReadCloser, err error) {
 	if !silent && f.verbose {
 		defer func() {
 			pid := -1
@@ -134,6 +156,12 @@ func (f *flags) start0(bin string, args []string, pipe, silent bool) (cmd *exec.
 	}()
 
 	cmd = exec.CommandContext(ctx, bin, args...)
+	if env != nil {
+		cmd.Env = os.Environ()
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
 	cmd.WaitDelay = time.Second
 	if pipe {
 		if stdout, err = cmd.StdoutPipe(); err != nil {
@@ -158,7 +186,7 @@ func (f *flags) start0(bin string, args []string, pipe, silent bool) (cmd *exec.
 }
 
 func (f *flags) startX11vnc(args []string) (cmd *exec.Cmd, cancel context.CancelFunc, port int, err error) {
-	cmd, cancel, stdout, err := f.start(x11vncBin, args, true)
+	cmd, cancel, stdout, err := f.start(x11vncBin, args, true, nil)
 	if err != nil {
 		log("%v", err)
 		return nil, nil, 0, err
@@ -334,6 +362,9 @@ func (f *flags) ServeHTTP(w http.ResponseWriter, rq *http.Request) {
 		return
 	}
 
+	if dbg {
+		trc("GET %q %q %q", rq.URL.Path, rq.Host, rq.Header)
+	}
 	switch {
 	case rq.URL.Path == "/":
 		f.connect(w)
@@ -342,7 +373,15 @@ func (f *flags) ServeHTTP(w http.ResponseWriter, rq *http.Request) {
 		strings.HasPrefix(rq.URL.Path, "/favicon"),
 		strings.HasPrefix(rq.URL.Path, "/vendor/"):
 
-		http.ServeFileFS(w, rq, assets, path.Join("embed", rq.URL.Path))
+		p := path.Join("embed", strings.ReplaceAll(rq.URL.Path, "/vendor/", "/vendor_/"))
+		if dbg {
+			f, err := assets.Open(p)
+			trc("%q -> (%p, %v)", p, f, err)
+			if err == nil {
+				f.Close()
+			}
+		}
+		http.ServeFileFS(w, rq, assets, p)
 	default:
 		a := strings.Split(rq.URL.Path, "_")
 		if len(a) != 3 {
@@ -367,7 +406,7 @@ func (f *flags) ServeHTTP(w http.ResponseWriter, rq *http.Request) {
 			host = host[:x]
 		}
 		c.flags = f
-		c.connect(w, host, clientID, width, height)
+		c.connect(w, host, clientID, width, height, rq)
 	}
 }
 
@@ -434,7 +473,7 @@ func (c *client) poll() {
 				return
 			}
 
-			cmd, cancel, stdout, err := c.flags.start0(x11vncBin, []string{"-query", "client_count", "-display", c.display}, true, true)
+			cmd, cancel, stdout, err := c.flags.start0(x11vncBin, []string{"-query", "client_count", "-display", c.display}, true, true, nil)
 			if err != nil {
 				log("%v", err)
 				c.Unlock()
@@ -512,7 +551,7 @@ func (c *client) disconnect() {
 	exec.Command("sh", "-c", arg).Run()
 }
 
-func (c *client) connect(w http.ResponseWriter, host, id, width, height string) {
+func (c *client) connect(w http.ResponseWriter, host, id, width, height string, rq *http.Request) {
 	defer func() {
 		if c.isConnected {
 			go c.poll()
@@ -540,7 +579,7 @@ func (c *client) connect(w http.ResponseWriter, host, id, width, height string) 
 
 	display := fmt.Sprintf(":%d", displayNum)
 	args := []string{display, "-screen", "0", fmt.Sprintf("%sx%sx%d", width, height, depth)}
-	if c.xvfbCmd, c.xvfbCancel, _, err = c.flags.start(xvfbBin, args, false); err != nil {
+	if c.xvfbCmd, c.xvfbCancel, _, err = c.flags.start(xvfbBin, args, false, nil); err != nil {
 		log("%v", err)
 		http.Error(w, "cannot create new X server", http.StatusFailedDependency)
 		return
@@ -560,7 +599,7 @@ func (c *client) connect(w http.ResponseWriter, host, id, width, height string) 
 	}
 
 	args = []string{fmt.Sprint(c.port), fmt.Sprintf("localhost:%d", c.port)}
-	if c.websockifyCmd, c.websockifyCancel, _, err = c.flags.start(websockifyBin, args, false); err != nil {
+	if c.websockifyCmd, c.websockifyCancel, _, err = c.flags.start(websockifyBin, args, false, nil); err != nil {
 		log("%v", err)
 		http.Error(w, "cannot start websockify", http.StatusFailedDependency)
 		return
@@ -585,12 +624,23 @@ func (c *client) connect(w http.ResponseWriter, host, id, width, height string) 
 
 	defer mu.Unlock()
 
-	os.Setenv("DISPLAY", display)
-	os.Setenv("TK9_VNC", "1")
-	os.Setenv("TK9_VNC_WIDTH", fmt.Sprint(width))
-	os.Setenv("TK9_VNC_HEIGHT", fmt.Sprint(height))
-	os.Setenv("TK9_VNC_DEPTH", fmt.Sprint(depth))
-	if c.appCmd, c.appCancel, _, err = c.flags.start(appBin, os.Args[1:], false); err != nil {
+	m := map[string]string{EnvVarMobile: ""}
+	if isMobileClient(rq) {
+		m[EnvVarMobile] = "1"
+		if s := os.Getenv(ScaleEnvVarMobile); s != "" {
+			m[scaleEnvVar] = s
+		}
+	}
+	m["DISPLAY"] = display
+	m[EnvVarVNC] = "1"
+	m["TK9_VNC_WIDTH"] = fmt.Sprint(width)
+	m["TK9_VNC_HEIGHT"] = fmt.Sprint(height)
+	m["TK9_VNC_DEPTH"] = fmt.Sprint(depth)
+	m[EnvVarInstanceStart] = fmt.Sprint(time.Now().UTC().UnixMilli())
+	if fi, err := os.Stat(appBin); err == nil {
+		m[EnvVarInstanceStat] = fmt.Sprint(fi.ModTime().UTC().UnixMilli())
+	}
+	if c.appCmd, c.appCancel, _, err = c.flags.start(appBin, os.Args[1:], false, m); err != nil {
 		log("%v", err)
 		http.Error(w, "cannot start new application instance", http.StatusFailedDependency)
 		return
@@ -611,6 +661,19 @@ func (c *client) connect(w http.ResponseWriter, host, id, width, height string) 
 		fmt.Fprintf(os.Stderr, "VNC server for DISPLAY=%s listening on :%d\n", display, c.port)
 	}
 	c.isConnected = true
+}
+
+func isMobileClient(rq *http.Request) (r bool) {
+	if dbg {
+		defer func() { trc("", r) }()
+	}
+
+	for _, v := range rq.Header["User-Agent"] {
+		if useragent.Parse(v).Mobile {
+			return true
+		}
+	}
+	return false
 }
 
 type clientRegister struct {

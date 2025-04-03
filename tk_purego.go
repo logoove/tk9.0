@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"testing"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -25,6 +26,7 @@ var (
 	allocator memory.Allocator
 
 	createCommandProc uintptr
+	deleteCommandProc uintptr
 	evalExProc        uintptr
 	getObjResultProc  uintptr
 	getStringProc     uintptr
@@ -32,16 +34,15 @@ var (
 	newStringObjProc  uintptr
 	runCmdProxy       = purego.NewCallback(eventDispatcher)
 	setObjResultProc  uintptr
+	splitListProc     uintptr
 	tclBinHandle      uintptr
 	tkBinHandle       uintptr
 )
 
 func init() {
-	if isBuilder {
-		return
+	if runtime.GOOS == "darwin" && !testing.Testing() {
+		runtime.LockOSThread()
 	}
-
-	runtime.LockOSThread()
 }
 
 func lazyInit() {
@@ -49,9 +50,16 @@ func lazyInit() {
 		return
 	}
 
+	runtime.LockOSThread()
 	initialized = true
 
-	defer commonLazyInit()
+	defer func() {
+		// make sure we do not clobber global Error value.
+		if Error != nil {
+			return
+		}
+		commonLazyInit()
+	}()
 
 	var cacheDir string
 	if cacheDir, Error = getCacheDir(); Error != nil {
@@ -117,11 +125,19 @@ func bindLibs(cacheDir string) {
 		return
 	}
 
+	if deleteCommandProc, Error = purego.Dlsym(tclBinHandle, "Tcl_DeleteCommand"); Error != nil {
+		return
+	}
+
 	if evalExProc, Error = purego.Dlsym(tclBinHandle, "Tcl_EvalEx"); Error != nil {
 		return
 	}
 
 	if setObjResultProc, Error = purego.Dlsym(tclBinHandle, "Tcl_SetObjResult"); Error != nil {
+		return
+	}
+
+	if splitListProc, Error = purego.Dlsym(tclBinHandle, "Tcl_SplitList"); Error != nil {
 		return
 	}
 
@@ -151,7 +167,7 @@ func bindLibs(cacheDir string) {
 		return
 	}
 
-	fn := filepath.Join(cacheDir, "libtk9.0.0.zip")
+	fn := filepath.Join(cacheDir, fmt.Sprintf("lib%s.zip", libVersion))
 	if _, Error := eval(fmt.Sprintf("zipfs mount %s /app", fn)); Error != nil {
 		return
 	}
@@ -159,6 +175,23 @@ func bindLibs(cacheDir string) {
 	if r, _, _ := purego.SyscallN(tkInitProc, interp); r != tcl_ok {
 		Error = fmt.Errorf("failed to initialize Tk: %s", tclResult())
 		return
+	}
+
+	for _, dll := range moreDLLs {
+		var handle, initProc uintptr
+		if handle, Error = purego.Dlopen(filepath.Join(cacheDir, dll.dll), purego.RTLD_LAZY|purego.RTLD_GLOBAL); Error != nil {
+			return
+		}
+
+		if initProc, Error = purego.Dlsym(handle, dll.initProc); Error != nil {
+			return
+		}
+
+		r, _, _ := purego.SyscallN(initProc, interp)
+		if r != tcl_ok {
+			Error = fmt.Errorf("failed to initialize %s: %s", dll.dll, tclResult())
+			return
+		}
 	}
 }
 
@@ -261,23 +294,6 @@ func tclResult() string {
 	return ""
 }
 
-func goString(p uintptr) string { // Result can be retained.
-	if p == 0 {
-		return ""
-	}
-
-	p0 := p
-	var n int
-	for ; *(*byte)(unsafe.Pointer(p)) != 0; n++ {
-		p++
-	}
-	if n != 0 {
-		return string(unsafe.Slice((*byte)(unsafe.Pointer(p0)), n))
-	}
-
-	return ""
-}
-
 func cString(s string) (r uintptr, err error) {
 	if s == "" {
 		return 0, nil
@@ -349,4 +365,20 @@ func setResult(s string) (err error) {
 
 	purego.SyscallN(setObjResultProc, interp, obj)
 	return nil
+}
+
+func callSplitList(cList uintptr, argcPtr uintptr, argvPtr uintptr) (r1 uintptr, r2 uintptr, err uintptr) {
+	return purego.SyscallN(splitListProc, interp, cList, argcPtr, argvPtr)
+}
+
+// Internal malloc enabling parseList() in tk.go to not care about the target
+// specific implemetations.
+func malloc(sz int) (r uintptr, err error) {
+	return allocator.UintptrMalloc(sz)
+}
+
+// Internal free enabling parseList() in tk.go to not care about the target
+// specific implemetations.
+func free(p uintptr) (err error) {
+	return allocator.UintptrFree(p)
 }

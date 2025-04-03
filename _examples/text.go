@@ -1,6 +1,7 @@
 package main
 
 import . "modernc.org/tk9.0"
+import _ "modernc.org/tk9.0/themes/azure"
 
 func main() {
 	var scroll *TScrollbarWidget
@@ -59,5 +60,6 @@ which is word-wrapped by the widget.</spacing>
 to 2 points, which results in just a bit of extra space within a pararaph. Spacing3 isn't used in this example.</spacing>
 <br><spacing>To see where the space is, select ranges of text within these paragraphs. The selection highlight will cover the extra
 space.</spacing>`)
+	ActivateTheme("azure light")
 	App.Center().Wait()
 }

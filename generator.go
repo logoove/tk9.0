@@ -276,15 +276,7 @@ var (
 			},
 		},
 		"grab": {
-			ignore: true, //MAYBE later
-			// commands: cmdOpts{
-			// 	"Grab": []string{
-			// 		"-global",
-			// 	},
-			// 	"GrabSet": []string{
-			// 		"-global",
-			// 	},
-			// },
+			manual: true, //done
 		},
 		"grid": {
 			manual: true, // done
@@ -376,7 +368,7 @@ var (
 				"-y",
 			}},
 		},
-		"popup": {manual: true}, //TODO
+		"popup": {manual: true}, // done
 		"print": {manual: true}, //TODO
 		"raise": {manual: true}, // done
 		"selection": {
@@ -509,10 +501,12 @@ var (
 	}
 
 	hideOpts = map[string]bool{
-		"Data": true,
-		"Font": true,
-		"From": true,
-		"To":   true,
+		"Data":   true,
+		"Font":   true,
+		"From":   true,
+		"To":     true,
+		"Type":   true,
+		"Values": true,
 	}
 
 	hideOptMethods = map[string]bool{
@@ -572,6 +566,7 @@ func main() {
 }
 
 func makeTokenizer() {
+	return // No more needed, only adds diff noise.
 	args := []string{
 		"-lexstring", "mlToken",
 		"-pkg", "tk9_0",
@@ -1056,8 +1051,15 @@ func (j *job) widgetStdStyles(doc *document) (r []string) {
 }
 
 func (j *job) widgetSpecificOpts(xref string, doc *document) (r []*option) {
+	ok := false
 	walk(0, doc.root, func(n *html.Node) (dive bool) {
-		if nodeIs(n, "OP") {
+		if nodeIs(n, "SH") {
+			s := strings.ToLower(n.FirstChild.Data)
+			// Reject options within section headings like "TAB OPTIONS".
+			ok = strings.Contains(s, "widget") && strings.Contains(s, "specific") && strings.Contains(s, "options")
+		}
+
+		if ok && nodeIs(n, "OP") {
 			tclName := strings.TrimSpace(n.FirstChild.Data)
 			a := strings.Fields(tclName)
 			tclName = strings.TrimLeft(a[0], `"\`)

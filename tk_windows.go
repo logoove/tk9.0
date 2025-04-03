@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"github.com/evilsocket/islazy/zip"
@@ -18,11 +19,28 @@ import (
 	"modernc.org/memory"
 )
 
+// trcw prints and return caller's position and an optional message tagged with TRC. Output goes to stderr.
+//
+//lint:ignore U1000 debug helper
+func trcw(s string, args ...interface{}) string {
+	switch {
+	case s == "":
+		s = fmt.Sprintf(strings.Repeat("%v ", len(args)), args...)
+	default:
+		s = fmt.Sprintf(s, args...)
+	}
+	r := fmt.Sprintf("%s: TRC(id=%v tid=%v) %s", origin(2), goroutineID(), windows.GetCurrentThreadId(), s)
+	fmt.Fprintf(os.Stderr, "%s\n", r)
+	os.Stderr.Sync()
+	return r
+}
+
 var (
 	// No mutex, the package must be used by a single goroutine only.
 	allocator memory.Allocator
 
 	createCommandProc *windows.Proc
+	deleteCommandProc *windows.Proc
 	evalExProc        *windows.Proc
 	getObjResultProc  *windows.Proc
 	getStringProc     *windows.Proc
@@ -30,23 +48,18 @@ var (
 	newStringObjProc  *windows.Proc
 	runCmdProxy       = windows.NewCallbackCDecl(eventDispatcher)
 	setObjResultProc  *windows.Proc
+	splitListProc     *windows.Proc
 	tclDll            *windows.DLL
 	tkDll             *windows.DLL
 )
-
-func init() {
-	if isBuilder {
-		return
-	}
-
-	runtime.LockOSThread()
-}
 
 func lazyInit() {
 	if initialized {
 		return
 	}
 
+	runtime.LockOSThread()
+	// trcw("LockOSThread")
 	initialized = true
 
 	defer commonLazyInit()
@@ -109,11 +122,19 @@ func bindLibs(cacheDir string) {
 		return
 	}
 
+	if deleteCommandProc, Error = tclDll.FindProc("Tcl_DeleteCommand"); Error != nil {
+		return
+	}
+
 	if evalExProc, Error = tclDll.FindProc("Tcl_EvalEx"); Error != nil {
 		return
 	}
 
 	if setObjResultProc, Error = tclDll.FindProc("Tcl_SetObjResult"); Error != nil {
+		return
+	}
+
+	if splitListProc, Error = tclDll.FindProc("Tcl_SplitList"); Error != nil {
 		return
 	}
 
@@ -143,13 +164,31 @@ func bindLibs(cacheDir string) {
 		return
 	}
 
-	if _, Error := eval("zipfs mount libtk9.0.0.zip /app"); Error != nil {
+	if _, Error := eval(fmt.Sprintf("zipfs mount lib%s.zip /app", libVersion)); Error != nil {
 		return
 	}
 
 	if r, _, _ := tkInit.Call(interp); r != tcl_ok {
 		Error = fmt.Errorf("failed to initialize Tk")
 		return
+	}
+
+	for _, dll := range moreDLLs {
+		var handle *windows.DLL
+		if handle, Error = windows.LoadDLL(dll.dll); Error != nil {
+			return
+		}
+
+		var initProc *windows.Proc
+		if initProc, Error = handle.FindProc(dll.initProc); Error != nil {
+			return
+		}
+
+		r, _, _ := initProc.Call(interp)
+		if r != tcl_ok {
+			Error = fmt.Errorf("failed to initialize %s: %s", dll.dll, tclResult())
+			return
+		}
 	}
 }
 
@@ -202,23 +241,6 @@ func tclResult() string {
 
 	if r, _, _ = getStringProc.Call(r); r != 0 {
 		return goString(r)
-	}
-
-	return ""
-}
-
-func goString(p uintptr) string { // Result can be retained.
-	if p == 0 {
-		return ""
-	}
-
-	p0 := p
-	var n int
-	for ; *(*byte)(unsafe.Pointer(p)) != 0; n++ {
-		p++
-	}
-	if n != 0 {
-		return string(unsafe.Slice((*byte)(unsafe.Pointer(p0)), n))
 	}
 
 	return ""
@@ -287,10 +309,13 @@ func eval(code string) (r string, err error) {
 
 	defer allocator.UintptrFree(cs)
 
+	// trcw("code=%s", code)
 	switch r0, _, _ := evalExProc.Call(interp, cs, uintptr(len(code)), tcl_eval_direct); r0 {
 	case tcl_ok, tcl_return:
+		// trcw("%s->%s, nil", code, tclResult())
 		return tclResult(), nil
 	default:
+		// trcw("%s->{}, %s", code, tclResult())
 		return "", fmt.Errorf("%s", tclResult())
 	}
 }
@@ -339,4 +364,20 @@ func Finalize() (err error) {
 		err = errors.Join(err, os.RemoveAll(v))
 	}
 	return err
+}
+
+func callSplitList(cList uintptr, argcPtr uintptr, argvPtr uintptr) (r1 uintptr, r2 uintptr, err error) {
+	return splitListProc.Call(interp, cList, argcPtr, argvPtr)
+}
+
+// Internal malloc enabling parseList() in tk.go to not care about the target
+// specific implemetations.
+func malloc(sz int) (r uintptr, err error) {
+	return allocator.UintptrMalloc(sz)
+}
+
+// Internal free enabling parseList() in tk.go to not care about the target
+// specific implemetations.
+func free(p uintptr) (err error) {
+	return allocator.UintptrFree(p)
 }

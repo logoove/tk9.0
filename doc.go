@@ -23,14 +23,25 @@
 //	$ CGO_ENABLED=0 go run hello.go
 //
 // The CGO_ENABLED=0 is optional and here it only demonstrates the program can
-// be built without CGo.
+// be built - or cross-compiled - without CGo.
 //
 // # In action
 //
 //   - [equ] A Plain TeX math editor.
+//   - [secure-files-go-gui] A GUI for [secure-files-go].
 //   - [visualmd] A WYSIWYG markdown editor.
 //
 // # Frequently Asked Questions
+//
+//   - Do I need to install the Tcl/Tk libraries on my system to use this
+//     package or programs that import it?
+//
+//     No. You still have to have a desktop environment installed on systems
+//     where that is not necessarily the case by default. That means some of
+//     the unix-like systems.  Usually installing any desktop environment, like
+//     Gnome, Xfce etc. provides all the required library (.so) files. The
+//     minimum is the [X Window System] and this package was tested to work
+//     there, although with all the limitations one can expect in this case.
 //
 //   - Windows: How to build an executable that doesn't open a console window when run?
 //
@@ -38,6 +49,117 @@
 //     a "GUI binary" instead of a "console binary.". To pass the flag to the
 //     Go build system use 'go build -ldflags -H=windowsgui somefile.go', for
 //     example.
+//
+//   - How to set/get the text of a Entry/TEntry widget?
+//
+//     Using [Textvariable]. See the _examples/entry.go example.
+//
+//   - What does CGo-free really mean?
+//
+//     [cgo] is a tool used by the Go build system when Go code uses the
+//     pseudo-import "C". For technical details please see the link. For us it
+//     is important that using CGo ends up invoking a C compiler during
+//     building of a Go program/package.  The C compiler is used to determine
+//     exact, possibly locally dependent, values of C preprocessor constants
+//     and other defines, as well as the exact layout of C structs. This
+//     enables the Go compiler to correctly handle things like, schematically
+//     `C.someStruct.someField` appearing in Go code.
+//
+//     At runtime a Go program using CGo must switch stacks when calling into
+//     C. Additionally the runtime scheduler is made aware of such calls into
+//     C. The former is necessary, the later is not, but it is good to have as
+//     it improves performance and provides better resource management.
+//
+//     There is an evironment variable defined, `CGO_ENABLED`. When the Go
+//     build system compiles Go code, it checks for the value of this env var.
+//     If it is not set or its value is "1", then CGo is enabled and used when
+//     'import "C"' is encountered.  If the env var contains "0", CGo is
+//     disabled and programs using 'import "C"' will not compile.
+//
+//     After this longish intro we can finally get to the short answer:
+//     CGo-free means this package can be compiled with CGO_ENABLED=0. In other
+//     words, there's no 'import "C"' clause anywhere.
+//
+//     The consequences of being CGo-free follows from the above. The Go build system
+//     does not need to invoke a C compiler when compiling this package. Hence users
+//     don't have to have a C compiler installed in their machines.
+//
+//     There are advantages when a C compiler is not invoked during
+//     compilation/build of Go code.  Programs can be installed on all targets
+//     supported by this package the easy way: '$ go install
+//     example.com/foo@latest' and programs for all supported targets can be
+//     cross-compiled on all Go-supported targets just by setting the
+//     respective env vars, like performing '$ GOOS=darwin GOARCH=arm64 go
+//     build' on a Windows/AMD64 machine, for example.
+//
+//   - How does this package achieve being CGo-free?
+//
+//     The answer depends on the particular target in question. Targets
+//     supported by [purego] call into the Tcl/Tk C libraries without using
+//     CGo. See the source code at the link for how it is done.
+//
+//     On other targets CGo is avoided by transpiling all the C libraries and
+//     their transitive dependencies to Go.
+//
+//     In both cases the advantages are the same: CGo-free programs are
+//     go-installable and CGo-free programs can be cross-compiled without
+//     having a C compiler or a cross-C compiler tool chain installed.
+//
+//   - Does being CGo-free remove the overhead of crossing the Go-C boundary?
+//
+//     For the [purego] targets, no. Only the C compiler is not involved anymore.
+//
+//     For other supported targets the boundary for calling Tcl/Tk C API from
+//     Go is gone. No free lunches though, the transpilled code has to care about
+//     additional things the C code does not need to - with the respective
+//     performance penalties, now just in different places.
+//
+// # Change log
+//
+// Only selected releases appear here:
+//
+//   - 2025-03-16: v0.65.0 introduces support for many new image formats. See
+//     the list at [NewPhoto] but see also [issue 66].
+//
+// # Widget catalogue
+//
+//   - [ButtonWidget]
+//   - [CanvasWidget]
+//   - [EntryWidget]
+//   - [FrameWidget]
+//   - [CheckbuttonWidget]
+//   - [LabelframeWidget]
+//   - [LabelWidget]
+//   - [ListboxWidget]
+//   - [MenubuttonWidget]
+//   - [MenuWidget]
+//   - [MessageWidget]
+//   - [OptionMenuWidget]
+//   - [PanedwindowWidget]
+//   - [RadiobuttonWidget]
+//   - [ScaleWidget]
+//   - [ScrollbarWidget]
+//   - [SpinboxWidget]
+//   - [TButtonWidget]
+//   - [TComboboxWidget]
+//   - [TEntryWidget]
+//   - [TextWidget]
+//   - [TFrameWidget]
+//   - [TCheckbuttonWidget]
+//   - [TLabelframeWidget]
+//   - [TLabelWidget]
+//   - [TMenubuttonWidget]
+//   - [TNotebookWidget]
+//   - [ToplevelWidget]
+//   - [TPanedwindowWidget]
+//   - [TProgressbarWidget]
+//   - [TRadiobuttonWidget]
+//   - [TScaleWidget]
+//   - [TScrollbarWidget]
+//   - [TSeparatorWidget]
+//   - [TSizegripWidget]
+//   - [TSpinboxWidget]
+//   - [TTreeviewWidget]
 //
 // # Debugging
 //
@@ -109,6 +231,13 @@
 //
 //	-gcflags="github.com/ebitengine/purego/internal/fakecgo=-std"
 //
+// Specific to windows/386:
+//
+// There's an open [Go issue 54187] that affects [issue 54]. This target is no
+// more a first-class supported one. Moreover, Windows 11 do not support the
+// 386 architecture at all, meaning Go will eventually stop supporting
+// windows/386 as well.
+//
 // # Builders
 //
 // Builder results available at [modern-c.appspot.com].
@@ -178,7 +307,7 @@
 //
 // Package initialization is done lazily. This saves noticeable additional
 // startup time and avoids screen flicker in hybrid programs that use the GUI
-// only on demand.
+// only on demand. (For a hybrid example see _examples/ring.go.)
 //
 // Early package initialization can be enforced by [Initialize].
 //
@@ -220,9 +349,13 @@
 //
 // # OS thread
 //
-// This package should be used from the same goroutine that initialized the
-// package. Package initialization performs a runtime.LockOSThread, meaning
-// func main() will start execuing locked on the same OS thread.
+// This package should be used only from the same goroutine that initialized
+// the Tcl/Tk system and performed os.LockOSThread before doing so. The
+// initialization happens lazily on the first call to an Tcl/Tk API function or
+// it can be forced by calling [Initialize].
+//
+// Note that when running Go tests, the goroutine that executes TestMain is not
+// the same goroutine that executes the Test* functions.
 //
 // # Event handlers
 //
@@ -239,6 +372,12 @@
 //
 // When passing an argument of type [time.Durarion] to a function accepting
 // 'any', the duration is converted to an integer number of milliseconds.
+//
+//   - [image.Image]
+//
+// When passing an argument of type image.Image to a function accepting 'any',
+// the image is converted to a [encoding/base64] encoded string of the PNG
+// representation of the image.
 //
 //   - []byte
 //
@@ -2372,14 +2511,22 @@
 // Layout: Vertical.Scrollbar.trough -sticky ns -children {Vertical.Scrollbar.uparrow -side top -sticky {} Vertical.Scrollbar.downarrow -side bottom -sticky {} Vertical.Scrollbar.thumb -sticky nswe -unit 1 -children {Vertical.Scrollbar.grip -sticky {}}}PASS
 //
 // [FreeBSD]: https://github.com/ebitengine/purego/blob/7402fed73989eaf478f4f7905862d0f04537ac8c/internal/fakecgo/freebsd.go#L15
+// [Go issue 54187]: https://github.com/golang/go/issues/54187
 // [MVP]: https://en.wikipedia.org/wiki/Minimum_viable_product
 // [RERO]: https://en.wikipedia.org/wiki/Release_early,_release_often
 // [Tkinter]: https://en.wikipedia.org/wiki/Tkinter
+// [X Window System]: https://en.wikipedia.org/wiki/X_Window_System
+// [cgo]: https://pkg.go.dev/cmd/cgo
 // [documentation for cmd/link]: https://pkg.go.dev/cmd/link
 // [equ]: https://pkg.go.dev/modernc.org/equ
+// [issue 54]: https://gitlab.com/cznic/tk9.0/-/issues/54
+// [issue 66]: https://gitlab.com/cznic/tk9.0/-/issues/66
 // [issue tracker]: https://gitlab.com/cznic/tk9.0/-/issues
 // [jnml's LiberaPay]: https://liberapay.com/jnml/donate
 // [modern-c.appspot.com]: https://modern-c.appspot.com/-/builder/?importpath=modernc.org%2ftk9.0
+// [purego]: https://github.com/ebitengine/purego
+// [secure-files-go-gui]: https://github.com/darshanags/secure-files-go-gui
+// [secure-files-go]: https://github.com/darshanags/secure-files-go
 // [tcl.tk site]: https://www.tcl.tk/man/tcl9.0/TkCmd/index.html
 // [tk9.0/vnc package]: https://pkg.go.dev/modernc.org/tk9.0/vnc
 // [tkinter.ttk site]: https://docs.python.org/3/library/tkinter.ttk.html

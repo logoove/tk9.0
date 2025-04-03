@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	// Update when azure.zip file is change.
+	// Update when azure.zip file changed.
 	version = "v0.1.0"
 )
 
@@ -69,7 +69,7 @@ func setup(context ThemeContext) (err error) {
 	}
 
 	const azure = "azure.zip"
-	dir, err := mkzip(filepath.Join(root, "modernc.org", "tk9.0.0", "themes", "azure", version), azure, zip)
+	dir, err := mkzip(filepath.Join(root, "modernc.org", "tk9.0.1", "themes", "azure", version), azure, zip)
 	if err != nil {
 		return err
 	}

@@ -6,16 +6,15 @@ package tk9_0 // import "modernc.org/tk9.0"
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
 	"image/png"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -23,9 +22,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
-	"github.com/mat/besticon/v3/ico"
 	"golang.org/x/net/html"
+	"modernc.org/libtk9.0"
 )
 
 const (
@@ -41,7 +41,7 @@ const (
 	gnuplotTimeout = time.Minute //TODO do not let the UI freeze
 	goarch         = runtime.GOARCH
 	goos           = runtime.GOOS
-	libVersion     = "tk9.0.0"
+	libVersion     = libtk9_0.Version
 
 	tcl_eval_direct = 0x40000
 	tcl_ok          = 0
@@ -61,6 +61,8 @@ var NativeScaling float64
 // App is the main/root application window.
 var App = &Window{}
 
+var target = fmt.Sprintf("%s/%s", goos, goarch)
+
 //TODO? ErrorMsg
 
 // Error modes
@@ -70,6 +72,15 @@ const (
 	// Errors will be recorded into the Error variable using errors.Join
 	CollectErrors
 )
+
+const (
+	testHookWaitVar = "TK9_TEST_HOOK_WAIT"
+)
+
+type dllInfo struct {
+	dll      string
+	initProc string
+}
 
 // ErrorMode selects the action taken on errors.
 var ErrorMode int
@@ -86,10 +97,10 @@ var (
 	//go:embed embed/tklib/tooltip/tooltip.tcl
 	tooltip []byte
 
-	autocenterDisabled bool
-	appWithdrawn       bool
-	appIconified       bool
 	appDeiconified     bool
+	appIconified       bool
+	appWithdrawn       bool
+	autocenterDisabled bool
 	cleanupDirs        []string
 	exitHandler        Opt
 	finished           atomic.Int32
@@ -100,6 +111,7 @@ var (
 	initialized        bool
 	isBuilder          = os.Getenv("MODERNC_BUILDER") != ""
 	isVNC              = os.Getenv("TK9_VNC") == "1"
+	testHookWait       = os.Getenv(testHookWaitVar)
 	wmTitle            string
 
 	// https://pdos.csail.mit.edu/archive/rover/RoverDoc/escape_shell_table.html
@@ -136,14 +148,16 @@ var (
 	}
 
 	//TODO remove the associated tcl var on window destroy event both from the
-	//interp and this map.
+	// interp and this map.
 	textVariables = map[*Window]string{} // : tclName
 	variables     = map[*Window]*VariableOpt{}
 	windowIndex   = map[string]*Window{}
 )
 
 func commonLazyInit() {
-	eval(string(tooltip))
+	// Convert DOS line endings to Unix before evaluating.
+	// https://gitlab.com/cznic/tk9.0/-/issues/67
+	eval(string(bytes.ReplaceAll(tooltip, []byte{'\r', '\n'}, []byte{'\n'})))
 }
 
 func checkSig(dir string, sig map[string]string) (r bool) {
@@ -186,7 +200,7 @@ func checkSig(dir string, sig map[string]string) (r bool) {
 	return true
 }
 
-// Returns a single Tcl string, no braces, except {} if returned for s == "".
+// Returns a single Tcl string, no braces, except "{}" is returned for s == "".
 func tclSafeString(s string) string {
 	if s == "" {
 		return "{}"
@@ -450,6 +464,16 @@ func collect(options ...Opt) string {
 	return strings.Join(a, " ")
 }
 
+func collectOne(name string, options ...Opt) string {
+	for _, v := range options {
+		opt := v.optionString(nil)
+		if strings.HasPrefix(opt, name) {
+			return strings.TrimSpace(opt[len(name):])
+		}
+	}
+	return ""
+}
+
 // Opts is a list of options. It implements Opt.
 type Opts []Opt
 
@@ -506,6 +530,38 @@ type Event struct {
 	// The number of the last client request processed by the server (the serial
 	// field from the event). Valid for all event types.
 	Serial int64
+	// The width field from the event. Indicates the new or requested width of the
+	// window. Valid only for Configure, ConfigureRequest, Create, ResizeRequest,
+	// and Expose events.
+	Width string
+	// The height field from the event. Valid for the Configure, ConfigureRequest,
+	// Create, ResizeRequest, and Expose events. Indicates the new or requested
+	// height of the window.
+	Height string
+	// The x and y fields from the event. For Button, ButtonRelease, Motion, Key,
+	// KeyRelease, and MouseWheel events, X and Y indicate the position of the
+	// mouse pointer relative to the receiving window. For key events on the
+	// Macintosh these are the coordinates of the mouse at the moment when an X11
+	// KeyEvent is sent to Tk, which could be slightly later than the time of the
+	// physical press or release. For Enter and Leave events, the position where
+	// the mouse pointer crossed the window, relative to the receiving window. For
+	// Configure and Create requests, the x and y coordinates of the window
+	// relative to its parent window.
+	X, Y int
+	// The x_root and y_root fields from the event. If a virtual-root window
+	// manager is being used then the substituted values are the corresponding
+	// x-coordinate and y-coordinate in the virtual root. Valid only for Button,
+	// ButtonRelease, Enter, Key, KeyRelease, Leave and Motion events. Same meaning
+	// as X and Y, except relative to the (virtual) root window.
+	XRoot, YRoot int
+	// The delta value of a MouseWheel event. The delta value represents
+	// the rotation units the mouse wheel has been moved. The sign of the
+	// value represents the direction the mouse wheel was scrolled.
+	Delta int
+	// The state field from the event. For KeyPress, KeyRelease, ButtonPress,
+	// ButtonRelease, Enter, Leave, and Motion events, it is a bit field.
+	// Visibility events are not currently supported, and the value will be 0.
+	State Modifier
 
 	args []string
 }
@@ -533,9 +589,33 @@ func newEvent(arg1 string) (id int, e *Event, err error) {
 			e.EventWindow = windowIndex[v]
 		case 2: // %K
 			e.Keysym = v
+		case 3: // %w
+			e.Width = v
+		case 4: // %h
+			e.Height = v
+		case 5: // %x
+			e.X = atoi(v)
+		case 6: // %y
+			e.Y = atoi(v)
+		case 7: // %X
+			e.XRoot = atoi(v)
+		case 8: // %Y
+			e.YRoot = atoi(v)
+		case 9: // %D
+			e.Delta = atoi(v)
+		case 10: // %s
+			e.State = Modifier(atoi(v))
 		}
 	}
 	return id, e, nil
+}
+
+func atoi(s string) int {
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+
+	return 0
 }
 
 // SetReturnCodeOK sets return code of 'e' to TCL_OK.
@@ -638,18 +718,53 @@ func (e *eventHandler) optionString(w *Window) string {
 	e.w = w
 	switch {
 	case e.lateBind:
-		return fmt.Sprintf("%s {eventDispatcher {%v %%# %%W %%K}}", e.tcl, e.id)
+		return fmt.Sprintf("%s {eventDispatcher {%v %%# %%W %%K %%w %%h %%x %%y %%X %%Y %%D %%s}}", e.tcl, e.id)
 	default:
 		return fmt.Sprintf("%s {eventDispatcher %v}", e.tcl, e.id)
 	}
 }
 
-func optionString(v any) string {
+func hexDigit(b byte) byte {
+	if b <= 9 {
+		return '0' + b
+	}
+
+	return 'a' + b - 10
+}
+
+func tclBinaryBytes(s []byte) string {
+	var b strings.Builder
+	for _, v := range s {
+		b.WriteByte('\\')
+		b.WriteByte('x')
+		b.WriteByte(hexDigit(v >> 4))
+		b.WriteByte(hexDigit(v & 15))
+	}
+	return b.String()
+}
+
+var xpmSig = []byte("/* XPM */") // https://en.wikipedia.org/wiki/X_PixMap
+
+func optionString(v any) (r string) {
 	switch x := v.(type) {
 	case time.Duration:
 		return fmt.Sprint(int64((x + time.Millisecond/2) / time.Millisecond))
 	case []byte:
-		return base64.StdEncoding.EncodeToString(x)
+		switch {
+		case bytes.HasPrefix(x, xpmSig):
+			return tclSafeString(fmt.Sprintf("%s", v))
+		default:
+			return tclBinaryBytes(x)
+		}
+	case image.Image:
+		var buf bytes.Buffer
+		err := png.Encode(&buf, x)
+		if err != nil {
+			fail(err)
+			return ""
+		}
+
+		return base64.StdEncoding.EncodeToString(buf.Bytes())
 	case []FileType:
 		var a []string
 		for _, v := range x {
@@ -687,7 +802,7 @@ func optionString(v any) string {
 // begins with a dot, as in .a.b.c, then it must be the path name for a window;
 // otherwise it may be an arbitrary string. Each window has an associated list
 // of tags, and a binding applies to a particular window if its tag is among
-// those specified for the window. Although the bindtags command may be used to
+// those specified for the window. Although the [Bindtags] command may be used to
 // assign an arbitrary set of binding tags to a window, the default binding
 // tags provide the following behavior:
 //
@@ -726,6 +841,66 @@ func Bind(options ...any) {
 	evalErr(strings.Join(a, " "))
 }
 
+// bindtags — Determine which bindings apply to a window, and order of evaluation
+//
+// # Description
+//
+// When a binding is created with the bind command, it is associated either
+// with a particular window such as .a.b.c, a class name such as Button, the
+// keyword all, or any other string. All of these forms are called binding
+// tags. Each window contains a list of binding tags that determine how events
+// are processed for the window. When an event occurs in a window, it is
+// applied to each of the window's tags in order: for each tag, the most
+// specific binding that matches the given tag and event is executed. See the
+// bind command for more information on the matching process.
+//
+// By default, each window has four binding tags consisting of the name of the
+// window, the window's class name, the name of the window's nearest toplevel
+// ancestor, and all, in that order. Toplevel windows have only three tags by
+// default, since the toplevel name is the same as that of the window. The
+// bindtags command allows the binding tags for a window to be read and
+// modified.
+//
+// If bindtags is invoked with only one argument, then the current set of
+// binding tags for window is returned as a list. If the tagList argument is
+// specified to bindtags, then it must be a proper list; the tags for window
+// are changed to the elements of the list. The elements of tagList may be
+// arbitrary strings; however, any tag starting with a dot is treated as the
+// name of a window; if no window by that name exists at the time an event is
+// processed, then the tag is ignored for that event. The order of the elements
+// in tagList determines the order in which binding scripts are executed in
+// response to events. For example, the command
+//
+//	Bindtags(myBtn, "all", App, "Button", myBtn)
+//
+// reverses the order in which binding scripts will be evaluated for a button
+// myBtn so that all bindings are invoked first, following by bindings for
+// buttons (App), followed by class bindings, followed by bindings for
+// myBtn. If tagList is an empty list then the binding tags for window are
+// returned to the default state described above.
+//
+// The bindtags command may be used to introduce arbitrary additional binding
+// tags for a window, or to remove standard tags. For example, the command
+//
+//	Bindtags(myBtn, myBtn, "TrickyButton", App, "all")
+//
+// replaces the Button tag for myBtn with TrickyButton. This means that the
+// default widget bindings for buttons, which are associated with the Button
+// tag, will no longer apply to myBtn, but any bindings associated with
+// TrickyButton (perhaps some new button behavior) will apply.
+//
+// Additional information might be available at the [Tcl/Tk bindtags] page.
+//
+// [Tcl/Tk bindtags]: https://www.tcl.tk/man/tcl9.0/TkCmd/bindtags.html
+func Bindtags(w *Window, tagList ...any) (r []string) {
+	switch len(tagList) {
+	case 0:
+		return parseList(evalErr(fmt.Sprintf("bindtags %s", w)))
+	default:
+		return parseList(evalErr(fmt.Sprintf("bindtags %s {%s}", w, tclSafeList(flat(tagList...)...))))
+	}
+}
+
 // Img represents a Tk image.
 type Img struct {
 	name string
@@ -735,13 +910,12 @@ type Img struct {
 //
 // # Description
 //
-// Deletes 'm!. If there are
-// instances of the image displayed in widgets, the image will not actually
-// be deleted until all of the instances are released. However, the association
-// between the instances and the image manager will be dropped. Existing
-// instances will retain their sizes but redisplay as empty areas. If a deleted
-// image is recreated with another call to image create, the existing instances
-// will use the new image.
+// Deletes 'm'. If there are instances of the image displayed in widgets, the
+// image will not actually be deleted until all of the instances are released.
+// However, the association between the instances and the image manager will be
+// dropped. Existing instances will retain their sizes but redisplay as empty
+// areas. If a deleted image is recreated with another call to image create,
+// the existing instances will use the new image.
 func (m *Img) Delete() {
 	evalErr(fmt.Sprintf("image delete %s", m))
 }
@@ -830,13 +1004,28 @@ func NewBitmap(options ...Opt) *Img {
 // of transparency (the alpha channel). A photo image is stored internally in
 // full color (32 bits per pixel), and is displayed using dithering if
 // necessary. Image data for a photo image can be obtained from a file or a
-// string, or it can be supplied from C code through a procedural interface. At
-// present, only PNG, GIF, PPM/PGM, and (read-only) SVG formats are supported,
-// but an interface exists to allow additional image file formats to be added
-// easily. A photo image is (semi)transparent if the image data it was obtained
-// from had transparency information. In regions where no image data has been
-// supplied, it is fully transparent. Transparency may also be modified with
-// the transparency set subcommand.
+// string, or it can be supplied from C code through a procedural interface. A
+// photo image is (semi)transparent if the image data it was obtained from had
+// transparency information. In regions where no image data has been supplied,
+// it is fully transparent. Transparency may also be modified with the
+// transparency set subcommand.
+//
+// # Supported image formats
+//
+//   - BMP
+//   - GIF
+//   - ICO
+//   - JPEG
+//   - PCX
+//   - PNG
+//   - PPM
+//   - SVG
+//   - TGA
+//   - TIFF
+//   - XBM
+//   - XMP
+//
+// # Photo Options
 //
 //   - [Data] string
 //
@@ -896,7 +1085,489 @@ func NewBitmap(options ...Opt) *Img {
 //
 // Additional information might be available at the [Tcl/Tk photo] page.
 //
+// # Format("bmp") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 2.0.
+//
+//     If set to true, additional information about the read or written image
+//     is printed to stdout. Default is false.
+//
+//   - -resolution xres ?yres?
+//
+//     This option is supported for writing only. Available since version 2.0.
+//     An incompatible version of this option was introduced in version 1.4.1.
+//
+//     Set the resolution values of the written image file. If yres is not
+//     specified, it is set to the value of xres.
+//
+//     If option is not specified, the DPI and aspect values of the metadata
+//     dictionary are written. If no metadata values are available, no
+//     resolution values are written.
+//
+//   - -xresolution xres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the horizontal resolution value of the written image file.
+//
+//   - -yresolution yres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the vertical resolution value of the written image file.
+//
+// Additional information might be available at the [tkImg-bmp] page.
+//
+// # Format("ico") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since version
+//     1.3.
+//
+//     If set to true, additional information about the read or written image is
+//     printed to stdout. Default is false.
+//
+//   - -index integer
+//
+//     This option is supported for reading only. Available since version 1.3.
+//
+//     Read the page at specified index. The first page is at index 0. Default is
+//     0.
+//
+// Additional information might be available at the [tkImg-ico] page.
+//
+// # Format("jpeg") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since version
+//     2.0.
+//
+//     If set to true, additional information about the read or written image is
+//     printed to stdout. Default is false.
+//
+//   - -fast
+//
+//     This option is supported for reading only. Available since version
+//     1.2.4.
+//
+//     If specified, it activates a processing mode which is fast, but
+//     provides only low-quality information.
+//
+//   - -grayscale
+//
+//     This option is supported for reading and writing. Available since
+//     version 1.2.4.
+//
+//     Usage of this option forces incoming images to grayscale and written
+//     images will be monochrome.
+//
+//   - -optimize
+//
+//     This option is supported for writing only. Available since version
+//     1.2.4.
+//
+//     If specified, it causes the writer to optimize the Huffman table used
+//     to encode the JPEG coefficients.
+//
+//   - -progressive
+//
+//     This option is supported for writing only. Available since version
+//     1.2.4.
+//
+//     If specified, it causes the creation of a progressive JPEG file.
+//
+//   - -quality n
+//
+//     This option is supported for writing only. Available since version
+//     1.2.4.
+//
+//     It specifies the compression level as a quality percentage. The higher the
+//     quality, the less the compression. The nominal range for n is 0...100.
+//     Useful values are in the range 5...95. The default value is 75.
+//
+//   - -smooth n
+//
+//     This option is supported for writing only. Available since version
+//     1.2.4.
+//
+//     When used the writer will smooth the image before performing the
+//     compression. Values in the 10...30 are usually enough. The default is
+//     0, i.e no smoothing.
+//
+//   - -resolution xres ?yres?
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the resolution values of the written image file. If yres is not
+//     specified, it is set to the value of xres.
+//
+//     If option is not specified, the DPI and aspect values of the metadata
+//     dictionary are written. If no metadata values are available, no
+//     resolution values are written.
+//
+//   - -xresolution xres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the horizontal resolution value of the written image file.
+//
+//   - -yresolution yres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the vertical resolution value of the written image file.
+//
+// Additional information might be available at the [tkImg-jpeg] page.
+//
+// # Format("pcx") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 1.3.
+//
+//     If set to true, additional information about the read or written image
+//     is printed to stdout. Default is false.
+//
+//   - -compression string
+//
+//     This option is supported for writing only. Available since version 1.3.
+//
+//     Set the compression mode to either none or rle. Default is rle.
+//
+//   - -resolution xres ?yres?
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the resolution values of the written image file. If yres is not
+//     specified, it is set to the value of xres.
+//
+//     If option is not specified, the DPI and aspect values of the metadata
+//     dictionary are written. If no metadata values are available, no
+//     resolution values are written.
+//
+//   - -xresolution xres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the horizontal resolution value of the written image file.
+//
+//   - -yresolution yres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the vertical resolution value of the written image file.
+//
+// Additional information might be available at the [tkImg-pcx] page.
+//
+// # Format("png") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 1.4.6.
+//
+//     If set to true, additional information about the read or written image
+//     is printed to stdout. Default is false.
+//
+//   - -alpha double
+//
+//     This option is supported for reading only. Available since version
+//     1.4.2.
+//
+//     An additional alpha filtering value for the overall image, which allows
+//     the background on which the image is displayed to show through. This
+//     usually also has the effect of desaturating the image. The alpha value
+//     must be between 0.0 and 1.0. Specifying an alpha value, overrides the
+//     setting of the -withalpha flag, i.e. reading a file which has no alpha
+//     channel (Grayscale, RGB) will add an alpha channel to the image
+//     independent of the -withalpha flag setting.
+//
+//   - -gamma double
+//
+//     This option is supported for reading only. Available since version
+//     1.4.6.
+//
+//     Use the specified gamma value when reading an image. This option
+//     overwrites gamma values specified in the file. If this option is not
+//     specified and no gamma value is in the file, a default value of 1.0 is
+//     used.
+//
+//   - -withalpha bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 1.4.1.
+//
+//     If set to false, an alpha channel is ignored during reading or writing.
+//     Default is true.
+//
+//     Note: This option was named -matte in previous versions and is still
+//     recognized.
+//
+//   - -resolution xres ?yres?
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the resolution values of the written image file. If yres is not
+//     specified, it is set to the value of xres.
+//
+//     If option is not specified, the DPI and aspect values of the metadata
+//     dictionary are written. If no metadata values are available, no
+//     resolution values are written.
+//
+//   - -xresolution xres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the horizontal resolution value of the written image file.
+//
+//   - -yresolution yres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the vertical resolution value of the written image file.
+//
+//   - -tag key value
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Each key-value pair will be written as a named text chunk where the key
+//     provides the name of the chunk and the value its contents. Currently the
+//     maximum number of -tag specifications are 10.
+//
+// Additional information might be available at the [tkImg-png] page.
+//
+// # Format("ppm") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 1.4.0.
+//
+//     If set to true, additional information about the read or written image
+//     is printed to stdout. Default is false.
+//
+//   - -scanorder string
+//
+//     This option is supported for reading only. Available since version
+//     1.4.0.
+//
+//     Specify the scanline order of the input image. Possible values: TopDown
+//     or BottomUp. Default is TopDown.
+//
+//   - -min double
+//
+//     This option is supported for reading only. Available since version
+//     1.4.0.
+//
+//     Specify the minimum pixel value to be used for mapping 16-bit input data
+//     to 8-bit image values. If not specified or negative, the minimum value
+//     found in the image data.
+//
+//   - -max float
+//
+//     This option is supported for reading only. Available since version
+//     1.4.0.
+//
+//     Specify the maximum pixel value to be used for mapping 16-bit input data
+//     to 8-bit image values. If not specified or negative, the maximum value
+//     found in the image data.
+//
+//   - -gamma double
+//
+//     This option is supported for reading only. Available since version
+//     1.4.0.
+//
+//     Specify a gamma correction to be applied when mapping 16-bit input data
+//     to 8-bit image values. Default is 1.0.
+//
+//   - -ascii bool
+//
+//     This option is supported for writing only. Available since version
+//     1.4.0.
+//
+//     If set to true, the file is written in PPM 8-bit ASCII format (P3).
+//     Default is false, i.e. write in PPM 8-bit binary format (P6).
+//
+// Additional information might be available at the [tkImg-ppm] page.
+//
+// # Format("tga") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 1.3.
+//
+//     If set to true, additional information about the read or written image
+//     is printed to stdout. Default is false.
+//
+//   - -withalpha bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 1.3.
+//
+//     If set to false, an alpha channel is ignored during reading or writing.
+//     Default is true.
+//
+//     Note: This option was named -matte in previous versions and is still
+//     recognized.
+//
+//   - -compression string
+//
+//     This option is supported for writing only. Available since version 1.3.
+//
+//     Set the compression mode to either none or rle. Default is rle.
+//
+// Additional information might be available at the [tkImg-tga] page.
+//
+// # Format("tiff") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 2.0.
+//
+//     If set to true, additional information about the read or written image
+//     is printed to stdout. Default is false.
+//
+//   - -index integer
+//
+//     This option is supported for reading only. Available since version
+//     1.4.0.
+//
+//     Read the page at specified index. The first page is at index 0. Default
+//     is 0.
+//
+//   - -compression string
+//
+//     This option is supported for writing only. Available since version
+//     1.2.4.
+//
+//     Set the compression mode to either none, jpeg, packbits, or deflate.
+//     Default is none.
+//
+//   - -byteorder string
+//
+//     This option is supported for writing only. Available since version
+//     1.2.4.
+//
+//     Set the byteorder to either none, bigendian, littleendian, network or
+//     smallendian. Default is none.
+//
+//     The values bigendian and network are aliases of each other, as are
+//     littleendian and smallendian.
+//
+//   - -resolution xres ?yres?
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the resolution values of the written image file. If yres is not
+//     specified, it is set to the value of xres.
+//
+//     If option is not specified, the DPI and aspect values of the metadata
+//     dictionary are written. If no metadata values are available, no
+//     resolution values are written.
+//
+//   - -xresolution xres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the horizontal resolution value of the written image file.
+//
+//   - -yresolution yres
+//
+//     This option is supported for writing only. Available since version 2.0.
+//
+//     Set the vertical resolution value of the written image file.
+//
+// Additional information might be available at the [tkImg-tiff] page.
+//
+// # Format("xbm") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 2.0.
+//
+//     If set to true, additional information about the read or written image
+//     is printed to stdout. Default is false.
+//
+//   - -foreground string
+//
+//     This option is supported for reading only. Available since version
+//     1.4.15.
+//
+//     Set the foreground color of the bitmap. Default value is black. The
+//     color string may be given in a format as accepted by Tk_GetColor.
+//
+//   - -background string
+//
+//     This option is supported for reading only. Available since version
+//     1.4.15.
+//
+//     Set the background color of the bitmap. Default value is transparent.
+//     The color string may be given in a format as accepted by Tk_GetColor.
+//
+// Additional information might be available at the [tkImg-xbm] page.
+//
+// # Format("xpm") additional options
+//
+// In addition the value of option [Format] is treated as a list and may contain
+// any of the special options listed below.
+//
+//   - -verbose bool
+//
+//     This option is supported for reading and writing. Available since
+//     version 2.0.
+//
+//     If set to true, additional information about the read or written image
+//     is printed to stdout. Default is false.
+//
+// Additional information might be available at the [tkImg-xpm] page.
+//
 // [Tcl/Tk photo]: https://www.tcl.tk/man/tcl9.0/TkCmd/photo.html
+// [tkImg-bmp]: https://tkimg.sourceforge.net/RefMan/files/img-bmp.html
+// [tkImg-ico]: https://tkimg.sourceforge.net/RefMan/files/img-ico.html
+// [tkImg-jpeg]: https://tkimg.sourceforge.net/RefMan/files/img-jpeg.html
+// [tkImg-pcx]: https://tkimg.sourceforge.net/RefMan/files/img-pcx.html
+// [tkImg-png]: https://tkimg.sourceforge.net/RefMan/files/img-png.html
+// [tkImg-ppm]: https://tkimg.sourceforge.net/RefMan/files/img-ppm.html
+// [tkImg-tga]: https://tkimg.sourceforge.net/RefMan/files/img-tga.html
+// [tkImg-tiff]: https://tkimg.sourceforge.net/RefMan/files/img-tiff.html
+// [tkImg-xbm]: https://tkimg.sourceforge.net/RefMan/files/img-xbm.html
+// [tkImg-xpm]: https://tkimg.sourceforge.net/RefMan/files/img-xmp.html
 func NewPhoto(options ...Opt) *Img {
 	nm := fmt.Sprintf("img%v", id.Add(1))
 	code := fmt.Sprintf("image create photo %s %s", nm, collect(options...))
@@ -1168,6 +1839,11 @@ func (w *Window) SetResizable(width, height bool) {
 // If an event handler invokes Wait again, the nested call to Wait must
 // complete before the outer call can complete.
 func (w *Window) Wait() {
+	if isBuilder && testHookWait != "" {
+		TclAfterIdle(Command(func() {
+			fmt.Println(testHookWait)
+		}))
+	}
 	if w == App {
 		switch {
 		case os.Getenv("TK9_VNC") == "1":
@@ -1182,7 +1858,7 @@ func (w *Window) Wait() {
 					WmDeiconify(App)
 				}
 			}
-			if autocenterDisabled {
+			if !autocenterDisabled {
 				autocenterDisabled = true
 				w.Center()
 			}
@@ -1244,6 +1920,14 @@ func (w *Window) IconPhoto(options ...Opt) {
 	evalErr(fmt.Sprintf("wm iconphoto %s %s", w, collect(options...)))
 }
 
+// DefaultIcon option.
+//
+// Known uses:
+//   - [IconPhoto] (command specific)
+func DefaultIcon(val ...any) Opt {
+	return rawOption("-default")
+}
+
 // WmTitle — change the window manager title
 //
 // # Description
@@ -1266,9 +1950,75 @@ func (w *Window) WmTitle(s string) string {
 
 // Center centers 'w' and returns 'w'.
 func (w *Window) Center() *Window {
-	autocenterDisabled = true
+	if w == App {
+		autocenterDisabled = true
+	}
 	evalErr(fmt.Sprintf("tk::PlaceWindow %s center", w))
 	return w
+}
+
+// Grid — Geometry manager that arranges widgets in a grid
+//
+// # Description
+//
+// Removes each of the windows from grid for its container and unmaps their
+// windows. The content will no longer be managed by the grid geometry manager.
+// The configuration options for that window are forgotten, so that if the
+// window is managed once more by the grid geometry manager, the initial
+// default settings are used.
+//
+// If the last content window of the container becomes unmanaged, this will
+// also send the virtual event <<NoManagedChild>> to the container; the
+// container may choose to resize itself (or otherwise respond) to such a
+// change.
+//
+// More information might be available at the [Tcl/Tk grid] page.
+//
+// [Tcl/Tk grid]: https://www.tcl.tk/man/tcl9.0/TkCmd/grid.html
+func GridForget(w ...*Window) {
+	if len(w) == 0 {
+		return
+	}
+
+	var a []string
+	for _, v := range w {
+		if v != nil {
+			a = append(a, v.String())
+		}
+	}
+	evalErr(fmt.Sprintf("grid forget %s", strings.Join(a, " ")))
+}
+
+// Grid — Geometry manager that arranges widgets in a grid
+//
+// # Description
+//
+// Removes each of the windows from grid for its container and unmaps their
+// windows. The content will no longer be managed by the grid geometry manager.
+// However, the configuration options for that window are remembered, so that
+// if the content window is managed once more by the grid geometry manager, the
+// previous values are retained.
+//
+// If the last content window of the container becomes unmanaged, this will
+// also send the virtual event <<NoManagedChild>> to the container; the
+// container may choose to resize itself (or otherwise respond) to such a
+// change.
+//
+// More information might be available at the [Tcl/Tk grid] page.
+//
+// [Tcl/Tk grid]: https://www.tcl.tk/man/tcl9.0/TkCmd/grid.html
+func GridRemove(w ...*Window) {
+	if len(w) == 0 {
+		return
+	}
+
+	var a []string
+	for _, v := range w {
+		if v != nil {
+			a = append(a, v.String())
+		}
+	}
+	evalErr(fmt.Sprintf("grid remove %s", strings.Join(a, " ")))
 }
 
 // Grid — Geometry manager that arranges widgets in a grid
@@ -1413,7 +2163,14 @@ func GridAnchor(w *Window, anchor string) string {
 // More information might be available at the [Tcl/Tk grid] page.
 //
 // [Tcl/Tk grid]: https://www.tcl.tk/man/tcl9.0/TkCmd/grid.html
-func GridRowConfigure(w Widget, index int, options ...Opt) {
+func GridRowConfigure(w Widget, index any, options ...Opt) {
+	switch x := index.(type) {
+	case []int:
+		s := fmt.Sprint(x)
+		index = "{" + s[1:len(s)-1] + "}"
+	default:
+		index = tclSafeString(fmt.Sprint(index))
+	}
 	evalErr(fmt.Sprintf("grid rowconfigure %s %v %s", w, index, collect(options...)))
 }
 
@@ -1458,8 +2215,28 @@ func Minsize(val ...any) Opt {
 // More information might be available at the [Tcl/Tk grid] page.
 //
 // [Tcl/Tk grid]: https://www.tcl.tk/man/tcl9.0/TkCmd/grid.html
-func GridColumnConfigure(w Widget, index int, options ...Opt) {
+func GridColumnConfigure(w Widget, index any, options ...Opt) {
+	switch x := index.(type) {
+	case []int:
+		s := fmt.Sprint(x)
+		index = "{" + s[1:len(s)-1] + "}"
+	default:
+		index = tclSafeString(fmt.Sprint(index))
+	}
 	evalErr(fmt.Sprintf("grid columnconfigure %s %v %s", w, index, collect(options...)))
+}
+
+// Pad option.
+//
+// The -pad option specifies the number of screen units that will be added to
+// the largest window contained completely in that column/row when the grid
+// geometry manager requests a size from the containing window.
+//
+// Known uses:
+//   - [GridColumnConfigure] (command specific)
+//   - [GridRowConfigure] (command specific)
+func Pad(val any) Opt {
+	return rawOption(fmt.Sprintf(`-pad %s`, tclSafeString(fmt.Sprint(val))))
 }
 
 // Configure alters the configuration of 'w' and returns 'w'.
@@ -1880,7 +2657,7 @@ func forceInit() {
 
 	defer func() { onceForceInit = true }()
 
-	evalErr("#")
+	evalErr("# forceInit() executed")
 }
 
 // ExitHandler returns a canned [Command] that destroys the [App].
@@ -2169,6 +2946,70 @@ func (f *FontFace) String() string {
 //
 // # Description
 //
+// Returns the amount in pixels that the tallest letter sticks up above the baseline
+// of the font, plus any extra blank space added by the designer of the font.
+//
+// Additional information might be available at the [Tcl/Tk font] page.
+//
+// [Tcl/Tk font]: https://www.tcl.tk/man/tcl9.0/TkCmd/font.html
+func (f *FontFace) MetricsAscent(window *Window) int {
+	metric := evalErr(fmt.Sprintf("font metrics %s -displayof %s -ascent", f.name, window))
+	return atoi(metric)
+}
+
+// NewFont — Create and inspect fonts.
+//
+// # Description
+//
+// Returns the largest amount in pixels that any letter sticks down below the baseline
+// of the font, plus any extra blank space added by the designer of the font.
+//
+// Additional information might be available at the [Tcl/Tk font] page.
+//
+// [Tcl/Tk font]: https://www.tcl.tk/man/tcl9.0/TkCmd/font.html
+func (f *FontFace) MetricsDescent(window *Window) int {
+	metric := evalErr(fmt.Sprintf("font metrics %s -displayof %s -descent", f.name, window))
+	return atoi(metric)
+}
+
+// NewFont — Create and inspect fonts.
+//
+// # Description
+//
+// Returns how far apart vertically in pixels two lines of text using the same font should
+// be placed so that none of the characters in one line overlap any of the characters
+// in the other line. This is generally the sum of the ascent above the baseline line plus
+// the descent below the baseline.
+//
+// Additional information might be available at the [Tcl/Tk font] page.
+//
+// [Tcl/Tk font]: https://www.tcl.tk/man/tcl9.0/TkCmd/font.html
+func (f *FontFace) MetricsLinespace(window *Window) int {
+	metric := evalErr(fmt.Sprintf("font metrics %s -displayof %s -linespace", f.name, window))
+	return atoi(metric)
+}
+
+// NewFont — Create and inspect fonts.
+//
+// # Description
+//
+// Returns a boolean flag that is true if this is a fixed-width font, where each normal character
+// is the same width as all the other characters, or is false if this is a proportionally-spaced font,
+// where individual characters have different widths. The widths of control characters, tab characters,
+// and other non-printing characters are not included when calculating this value.
+//
+// Additional information might be available at the [Tcl/Tk font] page.
+//
+// [Tcl/Tk font]: https://www.tcl.tk/man/tcl9.0/TkCmd/font.html
+func (f *FontFace) MetricsFixed(window *Window) bool {
+	metric := evalErr(fmt.Sprintf("font metrics %s -displayof %s -fixed", f.name, window))
+	return tclBool(metric)
+}
+
+// NewFont — Create and inspect fonts.
+//
+// # Description
+//
 // Creates a new font.
 //
 // The following options are supported on all platforms, and are used when
@@ -2233,13 +3074,25 @@ func (f *FontFace) String() string {
 // [Tcl/Tk font]: https://www.tcl.tk/man/tcl9.0/TkCmd/font.html
 func NewFont(options ...Opt) *FontFace {
 	nm := fmt.Sprintf("font%v", id.Add(1))
-	code := fmt.Sprintf("font create %s %s", nm, collect(options...))
+	code := ""
+	configure := false
+	if name := collectOne("-family", options...); name != "" &&
+		strings.HasPrefix(name, "Tk") {
+		code = "font actual " + name
+		nm = name
+		configure = true
+	} else {
+		code = fmt.Sprintf("font create %s %s", nm, collect(options...))
+	}
 	r, err := eval(code)
+	if err == nil && configure {
+		code := fmt.Sprintf("font configure %s %s", nm, collect(options...))
+		r, err = eval(code)
+	}
 	if err != nil {
 		fail(fmt.Errorf("code=%s -> r=%s err=%v", code, r, err))
 		return nil
 	}
-
 	return &FontFace{name: nm}
 }
 
@@ -2260,40 +3113,38 @@ func FontFamilies(options ...Opt) []string {
 	return parseList(evalErr(fmt.Sprintf("font families %s", collect(options...))))
 }
 
-// Can handle "{abc def} ghi" -> ["abc def", "ghi"].
-// Can not handle "{abc {def ghi}} jkl", too many levels.
-func parseList(s string) (r []string) {
-	r = strings.Fields(s)
-	w := 0
-	in := false
-	var a []string
-	for _, v := range r {
-		switch {
-		case in:
-			switch {
-			case strings.HasSuffix(v, "}"):
-				a = append(a, v[:len(v)-1])
-				r[w] = strings.Join(a, " ")
-				w++
-				in = false
-			default:
-				a = append(a, v)
-			}
-		default:
-			switch {
-			case v == "{}":
-				r[w] = ""
-				w++
-			case strings.HasPrefix(v, "{"):
-				a = append(a[:0], v[1:])
-				in = true
-			default:
-				r[w] = v
-				w++
-			}
-		}
+func parseList(list string) (r []string) {
+	if len(list) == 0 {
+		return nil
 	}
-	return r[:w]
+
+	cList, err := cString(list)
+	if err != nil {
+		fail(fmt.Errorf("failed to allocate C string for list : %w", err))
+		return
+	}
+	defer free(cList)
+
+	var _uintptr uintptr
+	pointers, err := malloc(int(2 * unsafe.Sizeof(_uintptr)))
+	if err != nil {
+		fail(fmt.Errorf("failed to allocate memory for argc & argv pointers : %w", err))
+		return
+	}
+	defer free(pointers)
+	argcPtr := pointers
+	argvPtr := pointers + unsafe.Sizeof(_uintptr)
+
+	callSplitList(cList, argcPtr, argvPtr)
+	argc := *((*int)(unsafe.Pointer(argcPtr)))
+	argv := unsafe.Slice((*(**uintptr)(unsafe.Pointer(argvPtr))), argc)
+
+	items := make([]string, argc)
+	for i, arg := range argv {
+		items[i] = goString(arg)
+	}
+
+	return items
 }
 
 // Delete — Manipulate fonts.
@@ -2645,6 +3496,14 @@ func (w *TextWidget) Count(options ...any) []string {
 	return parseList(evalErr(fmt.Sprintf("%s count %s", w, collectAny(options...))))
 }
 
+// All option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func All() Opt {
+	return rawOption("-all")
+}
+
 // Displayindices option.
 //
 // Known uses:
@@ -2675,6 +3534,14 @@ func Indices() Opt {
 //   - [TextWidget] (command specific)
 func Lines() Opt {
 	return rawOption("-lines")
+}
+
+// Mark option.
+//
+// Known uses:
+//   - [TextWidget] (command specific)
+func Mark() Opt {
+	return rawOption("-mark")
 }
 
 // Xpixels option.
@@ -3035,6 +3902,76 @@ func (w *TextWidget) Text() string {
 	return w.Get("1.0", "end-1c")[0]
 }
 
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Replaces the range of characters between index1 and index2 with the given
+// characters and tags. See the section on pathName insert for an explanation
+// of the handling of the tagList... arguments, and the section on pathName delete
+// for an explanation of the handling of the indices. If index2 corresponds to
+// an index earlier in the text than index1, an error will be generated.
+//
+// The deletion and insertion are arranged so that no unnecessary scrolling of
+// the window or movement of insertion cursor occurs. In addition the undo/redo
+// stack are correctly modified, if undo operations are active in the text widget.
+// The command returns an empty string.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) Replace(index1 any, index2 any, chars string, options ...any) string {
+	return evalErr(fmt.Sprintf("%s replace %s %s %s %s", w,
+		tclSafeString(fmt.Sprint(index1)),
+		tclSafeString(fmt.Sprint(index2)),
+		tclSafeString(chars),
+		collectAny(options...),
+	))
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Return the contents of the text widget from index1 up to, but not including
+// index2, including the text and information about marks, tags, and embedded
+// windows. If index2 is not specified, then it defaults to one character past
+// index1. The information is returned in the following format:
+//
+// key1 value1 index1 key2 value2 index2 ...
+//
+// The possible key values are text, mark, tagon, tagoff, image, and window.
+// The corresponding value is the text, mark name, tag name, image name, or
+// window name. The index information is the index of the start of the text,
+// mark, tag transition, image or window. One or more of the following switches
+// (or abbreviations thereof) may be specified to control the dump:
+//
+//   - [All] Return information about all elements: text, marks, tags, images and windows.
+//     This is the default.
+//   - [Command command] Instead of returning the information as the result of the
+//     dump operation, invoke the command on each element of the text widget within the range. The command has three arguments appended to it before it is evaluated: the key, value, and index.
+//   - [Image] Include information about images in the dump results.
+//   - [Mark] Include information about marks in the dump results.
+//   - [Tag] Include information about tag transitions in the dump results. Tag
+//     information is returned as tagon and tagoff elements that indicate the begin
+//     and end of each range of each tag, respectively.
+//   - [Text] Include information about text in the dump results. The value is the
+//     text up to the next element or the end of range indicated by index2. A text
+//     element does not span newlines. A multi-line block of text that contains no
+//     marks or tag transitions will still be dumped as a set of text segments that
+//     each end with a newline. The newline is part of the value.
+//   - [Window] Include information about embedded windows in the dump results. The
+//     value of a window is its Tk pathname, unless the window has not been created yet.
+//     (It must have a create script.) In this case an empty string is returned, and you
+//     must query the window by its index position to get more information.
+//
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) Dump(options ...any) []string {
+	return parseList(evalErr(fmt.Sprintf("%s dump %s", w, collectAny(options...))))
+}
+
 // LC encodes a text index consisting of a line and char number.
 type LC struct {
 	Line int // 1-based line number within the text content.
@@ -3247,26 +4184,31 @@ func (w *TextWidget) SelectAll() {
 // file or index2 is less than or equal to index1) then the command has no
 // effect.
 //
-// The function returns the new tag name.
+// Additional information might be available at the [Tcl/Tk text] page.
+//
+// [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
+func (w *TextWidget) TagAdd(tagName string, indexes ...any) string {
+	evalErr(fmt.Sprintf("%s tag add %s %s", w, tclSafeString(tagName), collectAny(indexes...)))
+	return tagName
+}
+
+// Text — Create and manipulate 'text' hypertext editing widgets
+//
+// # Description
+//
+// Remove the tag tagName from all of the characters starting at index1 and
+// ending just before index2 (the character at index2 is not affected). A single
+// command may contain any number of index1-index2 pairs. If the last index2 is
+// omitted then the tag is removed from the single character at index1. If there
+// are no characters in the specified range (e.g. index1 is past the end of the
+// file or index2 is less than or equal to index1) then the command has no effect.
+// This command returns an empty string.
 //
 // Additional information might be available at the [Tcl/Tk text] page.
 //
 // [Tcl/Tk text]: https://www.tcl.tk/man/tcl9.0/TkCmd/text.html
-func (w *TextWidget) TagAdd(options ...any) string {
-	tag := fmt.Sprintf("tag%d", id.Add(1))
-	var a []Opt
-	for _, v := range options {
-		switch x := v.(type) {
-		case Opts:
-			a = append(a, x)
-		case Opt:
-			a = append(a, x)
-		default:
-			a = append(a, stringOption(fmt.Sprint(x)))
-		}
-	}
-	evalErr(fmt.Sprintf("%s tag add %s %s", w, tag, collect(a...)))
-	return tag
+func (w *TextWidget) TagRemove(tagName string, indexes ...any) string {
+	return evalErr(fmt.Sprintf("%s tag remove %s %s", w, tclSafeString(tagName), collectAny(indexes...)))
 }
 
 // Text — Create and manipulate 'text' hypertext editing widgets
@@ -3665,12 +4607,7 @@ func FontchooserHide() {
 //
 // [Tcl/Tk getopenfile]: https://www.tcl.tk/man/tcl9.0/TkCmd/getOpenFile.html
 func GetOpenFile(options ...Opt) (r []string) {
-	switch s := evalErr(fmt.Sprintf("tk_getOpenFile %s", collect(options...))); {
-	case strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}"):
-		return parseList(s)
-	default:
-		return []string{s}
-	}
+	return parseList(evalErr(fmt.Sprintf("tk_getOpenFile %s", collect(options...))))
 }
 
 // FileType specifies a single file type for the [Filetypes] option.
@@ -3942,44 +4879,6 @@ func (w *Window) Raise(aboveThis Widget) {
 	evalErr(fmt.Sprintf("raise %s %s", w, b))
 }
 
-// Graph — use gnuplot to draw on a canvas. Graph returns 'w'.
-//
-// The 'script' argument is passed to a gnuplot executable, which must be
-// installed on the machine.  See the [gnuplot site] for documentation about
-// producing graphs. The script must not use the 'set term <device>' command.
-//
-// [gnuplot site]: http://www.gnuplot.info/
-func (w *CanvasWidget) Graph(script string) *CanvasWidget {
-	script = fmt.Sprintf("set terminal tkcanvas size %s, %s\n%s", w.Width(), w.Height(), script)
-	out, err := gnuplot(script)
-	if err != nil {
-		fail(fmt.Errorf("plot: executing script: %s", err))
-		return w
-	}
-
-	evalErr(fmt.Sprintf("%s\ngnuplot %s", out, w))
-	return w
-}
-
-func gnuplot(script string) (out []byte, err error) {
-	f, err := os.CreateTemp("", "tk9.0-")
-	if err != nil {
-		return nil, err
-	}
-
-	defer os.Remove(f.Name())
-
-	if err := os.WriteFile(f.Name(), []byte(script), 0660); err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), gnuplotTimeout)
-
-	defer cancel()
-
-	return exec.CommandContext(ctx, "gnuplot", f.Name()).Output()
-}
-
 // MenuItem represents an entry on a menu.
 type MenuItem struct {
 	id string
@@ -3996,6 +4895,29 @@ func (m *MenuItem) optionString(_ *Window) string {
 	}
 
 	return "mnu_non_existing"
+}
+
+// tk_popup — Post a popup menu
+//
+// # Description
+//
+// This procedure posts a menu at a given position on the screen and configures
+// Tk so that the menu and its cascaded children can be traversed with the
+// mouse or the keyboard. Menu is the name of a menu widget and x and y are the
+// root coordinates at which to display the menu. If entry is omitted or an
+// empty string, the menu's upper left corner is positioned at the given point.
+// Otherwise entry gives the index of an entry in menu and the menu will be
+// positioned so that the entry is positioned over the given point.
+//
+// Additional information might be available at the [Tcl/Tk popup] page.
+//
+// [Tcl/Tk popup]: https://www.tcl.tk/man/tk9.0/TkCmd/popup.htm
+func Popup(menu *Window, x, y int, entry any) {
+	var s string
+	if entry != nil && entry != "" {
+		s = collectAny(entry)
+	}
+	evalErr(fmt.Sprintf("tk_popup %s %v %v %s", menu, x, y, s))
 }
 
 // Menu — Create and manipulate 'menu' widgets and menubars
@@ -4100,6 +5022,39 @@ func (w *MenuWidget) Invoke(index uint) {
 // [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
 func (w *MenuWidget) EntryConfigure(index uint, options ...Opt) {
 	evalErr(fmt.Sprintf("%s entryconfigure %d %s", w, index, winCollect(w.Window, options...)))
+}
+
+// Menu — Create and manipulate 'menu' widgets and menubars
+//
+// # Description
+//
+// Returns the id of the menu entry given by index. This is the identifier that was
+// assigned to the entry when it was created using the add or insert widget command.
+// Returns an empty string for the tear-off entry, or if index is equivalent to {}.
+//
+// Note that while the raw tk command returns an id, that alone is of no practical use
+// to the caller. So a MenuItem representing the id is returned.
+//
+// Additional information might be available at the [Tcl/Tk menu] page.
+//
+// [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
+func (m *MenuWidget) Id(index int) *MenuItem {
+	id := evalErr(fmt.Sprintf("%s id %d", m, index))
+	return &MenuItem{id: id}
+}
+
+// Menu — Create and manipulate 'menu' widgets and menubars
+//
+// # Description
+//
+// Returns the numerical index corresponding to a MenuItem.
+//
+// Additional information might be available at the [Tcl/Tk menu] page.
+//
+// [Tcl/Tk menu]: https://www.tcl.tk/man/tk9.0/TkCmd/menu.htm
+func (m *MenuWidget) Index(item *MenuItem) int {
+	index := evalErr(fmt.Sprintf("%s index %s", m, item.id))
+	return atoi(index)
 }
 
 // TScrollbar — Control the viewport of a scrollable widget
@@ -4524,6 +5479,11 @@ func StyleLookup(style string, options ...any) string {
 //   - readonly - Widget should not allow user modification
 //   - selected - “On”, “true”, or “current” for things like Checkbuttons and
 //     radiobuttons
+//   - hover - The mouse cursor is within the widget. This is similar to the
+//     active state; it is used in some themes for widgets that provide distinct
+//     visual feedback for the active widget in addition to the active element
+//     within the widget.
+//   - user1-user6 - Freely usable for other purposes
 //
 // A state specification is a sequence of state names, optionally prefixed with
 // an exclamation point indicating that the bit is off.
@@ -4595,6 +5555,7 @@ func parseStyleMapOpts(in ...any) (r []string, err error) {
 	return r, nil
 }
 
+// https://www.tcl-lang.org/man/tcl9.0/TkCmd/ttk_widget.html#M34
 func isState(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -4607,14 +5568,21 @@ func isState(s string) bool {
 	switch s {
 	case
 		"active",
-		"alternate",
-		"background",
 		"disabled",
 		"focus",
-		"invalid",
 		"pressed",
+		"selected",
+		"background",
 		"readonly",
-		"selected":
+		"alternate",
+		"invalid",
+		"hover",
+		"user1",
+		"user2",
+		"user3",
+		"user4",
+		"user5",
+		"user6":
 
 		return true
 	default:
@@ -4712,6 +5680,9 @@ func StyleThemeStyles(themeName ...string) []string {
 //
 // Additional information might be available at the [Tcl/Tk style] page.
 // There's also a [Styles and Themes] tutorial at tkdoc.com.
+//
+// This mechanism is separate from the RegisterTheme/ActivateTheme one.  Use of
+// this function is best suited for the built in themes like "clam" etc.
 //
 // [Tcl/Tk style]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_style.html
 // [Styles and Themes]: https://tkdocs.com/tutorial/styles.html
@@ -5161,6 +6132,115 @@ func Indicatorsize(val any) Opt {
 	return rawOption(fmt.Sprintf(`-indicatorsize %s`, optionString(val)))
 }
 
+// Topmost option.
+//
+// Known uses:
+//   - [WmAttributes] (command specific)
+func Topmost(v bool) Opt {
+	return rawOption(fmt.Sprintf(`-topmost %s`, optionString(v)))
+}
+
+// Type option.
+//
+// Known uses:
+//   - [ClipboardAppend] (command specific)
+//   - [ClipboardGet] (command specific)
+//   - [Menu] (widget specific)
+//   - [MessageBox] (command specific)
+//   - [WmAttributes] (command specific)
+func Type(val any) Opt {
+	return rawOption(fmt.Sprintf(`-type %s`, optionString(val)))
+}
+
+// Type — Get the configured option value.
+//
+// Known uses:
+//   - [Menu] (widget specific)
+//   - [WmAttributes] (command specific)
+func (w *Window) Type() string {
+	return evalErr(fmt.Sprintf(`%s cget -type`, w))
+}
+
+// wm — Communicate with window manager
+//
+// # Description
+//
+//   - wm attributes window
+//   - wm attributes window ?option?
+//   - wm attributes window ?option value option value...?
+//
+// This subcommand returns or sets platform specific attributes associated with
+// a window. The first form returns a list of the platform specific flags and
+// their values. The second form returns the value for the specific option. The
+// third form sets one or more of the values. The values are as follows:
+//
+// [Topmost]: Specifies whether this is a topmost window (displays above all other windows).
+//
+// [Type]: Requests that the window should be interpreted by the window manager
+// as being of the specified type(s). This may cause the window to be decorated
+// in a different way or otherwise managed differently, though exactly what
+// happens is entirely up to the window manager. A list of types may be used,
+// in order of preference. The following values are mapped to constants defined
+// in the EWMH specification (using others is possible, but not advised):
+//
+//   - "desktop"
+//     Indicates a desktop feature.
+//   - "dock"
+//     Indicates a dock/panel feature.
+//   - "toolbar"
+//     Indicates a toolbar window that should be acting on behalf of another
+//     window, as indicated with wm transient.
+//   - "menu"
+//     Indicates a torn-off menu that should be acting on behalf of another
+//     window, as indicated with wm transient.
+//   - "utility"
+//     Indicates a utility window (e.g., palette or toolbox) that should be acting
+//     on behalf of another window, as indicated with wm transient.
+//   - "splash"
+//     Indicates a splash screen, displayed during application start up.
+//   - "dialog"
+//     Indicates a general dialog window, that should be acting on behalf of
+//     another window, as indicated with wm transient.
+//   - "dropdownMenu"
+//     Indicates a menu summoned from a menu bar, which should usually also be set
+//     to be override-redirected (with wm overrideredirect).
+//   - "popupMenu"
+//     Indicates a popup menu, which should usually also be set to be
+//     override-redirected (with wm overrideredirect).
+//   - "tooltip"
+//     Indicates a tooltip window, which should usually also be set to be
+//     override-redirected (with wm overrideredirect).
+//   - "notification"
+//     Indicates a window that provides a background notification of some event,
+//     which should usually also be set to be override-redirected (with wm
+//     overrideredirect).
+//   - "combo"
+//     Indicates the drop-down list of a combobox widget, which should usually
+//     also be set to be override-redirected (with wm overrideredirect).
+//   - "dnd"
+//     Indicates a window that represents something being dragged, which should
+//     usually also be set to be override-redirected (with wm overrideredirect).
+//   - "normal"
+//     Indicates a window that has no special interpretation.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func WmAttributes(w *Window, options ...any) string {
+	switch len(options) {
+	case 0:
+		return evalErr(fmt.Sprintf("wm attributes %s", w))
+	case 1:
+		if s := funcToTclOption(options[0]); s != "" {
+			return evalErr(fmt.Sprintf("wm attributes %s %s", w, s))
+		}
+
+		fallthrough
+	default:
+		return evalErr(fmt.Sprintf("wm attributes %s %s", w, collectAny(options...)))
+	}
+}
+
 // wm — Communicate with window manager
 //
 // # Description
@@ -5179,6 +6259,13 @@ func Indicatorsize(val any) Opt {
 // installs a handler for this protocol, which responds by destroying the
 // window. The wm protocol command can be used to replace this default handler
 // by one which responds differently.
+//
+// A common requirement is to make sure that even if the user clicks the
+// application's close button (X) a close handling function will be
+// called (e.g., to prompt to save unsaved changes). For example, to
+// ensure a custom func onQuit() function is called use:
+//
+//	WmProtocol(App, "WM_DELETE_WINDOW", onQuit)
 //
 // The list of available window manager protocols depends on the window
 // manager, but all window managers supported by Tk provide WM_DELETE_WINDOW.
@@ -5211,8 +6298,39 @@ func WmProtocol(w *Window, name string, command any) string {
 	case command == "":
 		return evalErr(fmt.Sprintf("wm protocol %s %s {}", w, tclSafeString(name)))
 	default:
-		return evalErr(fmt.Sprintf("wm protocol %s %s %s", w, tclSafeString(name), newEventHandler("", command).optionString(w)))
+		switch x := command.(type) {
+		case *eventHandler:
+			x.tcl = ""
+			return evalErr(fmt.Sprintf("wm protocol %s %s %s", w, tclSafeString(name), collect(x)))
+		default:
+			return evalErr(fmt.Sprintf("wm protocol %s %s %s", w, tclSafeString(name), newEventHandler("", command).optionString(w)))
+		}
 	}
+}
+
+// wm — Communicate with window manager
+//
+// # Description
+//
+// If container is specified, then the window manager is informed that window
+// is a transient window (e.g. pull-down menu) working on behalf of container
+// (where container is the path name for a top-level window). If container is
+// specified as an empty string then window is marked as not being a transient
+// window any more. Otherwise the command returns the path name of window's
+// current container, or an empty string if window is not currently a transient
+// window. A transient window will mirror state changes in the container and
+// inherit the state of the container when initially mapped. The directed graph
+// with an edge from each transient to its container must be acyclic. In
+// particular, it is an error to attempt to make a window a transient of
+// itself. The window manager may also decorate a transient window differently,
+// removing some features normally present (e.g., minimize and maximize
+// buttons) though this is entirely at the discretion of the window manager.
+//
+// More information might be available at the [Tcl/Tk wm] page.
+//
+// [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
+func WmTransient(options ...Opt) string {
+	return evalErr(fmt.Sprintf("wm transient %s", collect(options...)))
 }
 
 // wm — Communicate with window manager
@@ -5330,11 +6448,17 @@ func wmWithdraw(w *Window) {
 // More information might be available at the [Tcl/Tk wm] page.
 //
 // [Tcl/Tk wm]: https://www.tcl.tk/man/tcl9.0/TkCmd/wm.html
-func WmGeometry(w *Window, geometry string) string {
-	if w == App {
-		autocenterDisabled = true
+func WmGeometry(w *Window, geometry ...string) string {
+	// https://gitlab.com/cznic/tk9.0/-/commit/94774b2ee20e8d417f8eb12fa838eb9dcf58e8c6#note_2314759986
+	switch {
+	case len(geometry) == 0:
+		return evalErr(fmt.Sprintf("wm geometry %s", w))
+	default:
+		if w == App {
+			autocenterDisabled = true
+		}
+		return evalErr(fmt.Sprintf("wm geometry %s %s", w, tclSafeString(geometry[0])))
 	}
-	return evalErr(fmt.Sprintf("wm geometry %s %s", w, tclSafeString(geometry)))
 }
 
 // wm — Communicate with window manager
@@ -5681,40 +6805,35 @@ func FontConfigure(name string, options ...any) []string {
 	return parseList(evalErr(fmt.Sprintf("font configure %s %s", tclSafeString(name), collectAny(options...))))
 }
 
-var (
-	pngSig = []byte{137, 80, 78, 71, 13, 10, 26, 10} // http://www.libpng.org/pub/png/spec/1.2/PNG-Structure.html
-	icoSig = []byte{'\x00', '\x00', '\x01', '\x00'}  // https://en.wikipedia.org/wiki/ICO_(file_format)#Header
-)
-
 // Data option.
 //
 // Known uses:
 //   - [NewBitmap] (command specific)
 //   - [NewPhoto] (command specific)
 func Data(val any) Opt {
-	switch x := val.(type) {
-	case []byte:
-		switch {
-		case bytes.HasPrefix(x, pngSig):
-			// ok
-		case bytes.HasPrefix(x, icoSig):
-			b := bytes.NewBuffer(x)
-			img, err := ico.Decode(bytes.NewReader(x))
-			if err != nil {
-				fail(err)
-				return rawOption("")
-			}
+	return rawOption(fmt.Sprintf(`-data %s`, optionString(val)))
+}
 
-			b.Reset()
-			if err := png.Encode(b, img); err != nil {
-				fail(err)
-				return rawOption("")
-			}
-
-			val = b.Bytes()
+// winfo — Return window-related information
+//
+// # Description
+//
+// Returns a slice of all the children of window. Top-level windows are
+// returned as children of their logical parents. The list is in stacking
+// order, with the lowest window first, except for Top-level windows which are
+// not returned in stacking order. Use the wm stackorder command to query the
+// stacking order of Top-level windows.
+//
+// More information might be available at the [Tcl/Tk winfo] page.
+//
+// [Tcl/Tk winfo]: https://www.tcl.tk/man/tcl9.0/TkCmd/winfo.html
+func WinfoChildren(w *Window) (r []*Window) {
+	for _, v := range parseList(evalErr(fmt.Sprintf("winfo children %s", w))) {
+		if w := windowIndex[v]; w != nil {
+			r = append(r, w)
 		}
 	}
-	return rawOption(fmt.Sprintf(`-data %s`, optionString(val)))
+	return r
 }
 
 // winfo — Return window-related information
@@ -5980,6 +7099,7 @@ func Tab(tabId any) Opt {
 //
 // Known uses:
 //   - [Tooltip] (command specific)
+//   - [TextWidget] (command specific)
 func Tag(name string) Opt {
 	return rawOption(fmt.Sprintf(`-tag %s`, optionString(name)))
 }
@@ -6005,6 +7125,188 @@ func (w *TComboboxWidget) Current(newIndex any) (r string) {
 		arg = tclSafeString(fmt.Sprint(newIndex))
 	}
 	return evalErr(fmt.Sprintf("%s current %s", w, arg))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Returns the integer index of item within its parent's list of children or -1
+// otherwise.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Index(item any) (r int) {
+	s := evalErr(fmt.Sprintf("%s index %s", w, tclSafeString(fmt.Sprint(item))))
+	if n, err := strconv.ParseInt(s, 10, 32); err == nil {
+		return int(n)
+	}
+
+	return -1
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// If newchildren is not specified, returns the list of children belonging to
+// item.
+//
+// If newchildren is specified, replaces item's child list with newchildren.
+// Items in the old child list not present in the new child list are detached
+// from the tree. None of the items in newchildren may be an ancestor of item.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Children(item any, newChildren ...any) (r []string) {
+	switch {
+	case len(newChildren) == 0:
+		return parseList(evalErr(fmt.Sprintf("%s children %s", w, tclSafeString(fmt.Sprint(item)))))
+	default:
+		return parseList(evalErr(fmt.Sprintf("%s children %s {%s}", w, tclSafeString(fmt.Sprint(item)), tclSafeList(flat(newChildren...)))))
+	}
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Returns one of:
+//
+//   - heading
+//
+//     Tree heading area; use [pathname identify column x y] to determine the
+//     heading number.
+//
+//   - separator
+//
+//     Space between two column headings; [pathname identify column x y] will
+//     return the display column identifier of the heading to left of the
+//     separator.
+//
+//   - tree
+//
+//     The tree area.
+//
+//   - cell
+//
+//     A data cell.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) IdentifyRegion(x, y int) (r string) {
+	return evalErr(fmt.Sprintf("%s identify region %v %v", w, x, y))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Returns the item ID of the item at position x y.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) IdentifyItem(x, y int) (r string) {
+	return evalErr(fmt.Sprintf("%s identify item %v %v", w, x, y))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Returns the display column identifier of the cell at position x. The tree
+// column has ID #0.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) IdentifyColumn(x, y int) (r string) {
+	return evalErr(fmt.Sprintf("%s identify column %v %v", w, x, y))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Returns the cell identifier of the cell at position x, y. A cell identifier
+// is a list of item ID and column ID.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) IdentifyCell(x, y int) (r []string) {
+	return parseList(evalErr(fmt.Sprintf("%s identify cell %v %v", w, x, y)))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Returns the element at position x, y.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) IdentifyElement(x, y int) (r string) {
+	return evalErr(fmt.Sprintf("%s identify element %v %v", w, x, y))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Deletes each of the items in itemList and all of their descendants. The root
+// item may not be deleted. See also: detach.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Delete(itemList ...any) {
+	itemList = flat(itemList...)
+	if len(itemList) == 0 {
+		return
+	}
+
+	evalErr(fmt.Sprintf("%s delete {%v}", w, tclSafeList(itemList...)))
+}
+
+func flat(list ...any) (r []any) {
+	for _, v := range list {
+		switch x := v.(type) {
+		case []string:
+			for _, v := range x {
+				r = append(r, v)
+			}
+		case []any:
+			for _, v := range x {
+				r = append(r, flat(v))
+			}
+		default:
+			r = append(r, v)
+		}
+	}
+	return r
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Returns the ID of the parent of item, or "" if item is at the top level of
+// the hierarchy.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Parent(item any) (r string) {
+	if r = evalErr(fmt.Sprintf("%s parent %s", w, tclSafeString(fmt.Sprint(item)))); r == "{}" {
+		r = ""
+	}
+	return r
 }
 
 // ttk::treeview — hierarchical multicolumn data display widget
@@ -6136,8 +7438,71 @@ func Open(val bool) Opt {
 // More information might be available at the [Tcl/Tk treeview] page.
 //
 // [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
-func (w *TTreeviewWidget) Item(item any, options ...Opt) (r string) {
-	return evalErr(fmt.Sprintf("%s item %s %s", w, tclSafeString(fmt.Sprint(item)), collect(options...)))
+func (w *TTreeviewWidget) Item(item any, options ...any) (r string) {
+	if len(options) == 1 {
+		if s := funcToTclOption(options[0]); s != "" {
+			return evalErr(fmt.Sprintf("%s item %s %s", w, tclSafeString(fmt.Sprint(item)), s))
+		}
+	}
+
+	return evalErr(fmt.Sprintf("%s item %s %s", w, tclSafeString(fmt.Sprint(item)), collectAny(options...)))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Adds the specified tag to each of the listed items. If tag is already
+// present for a particular item, then the -tags for that item are unchanged.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) TagAdd(tag string, items ...any) {
+	evalErr(fmt.Sprintf("%s tag add %s %s", w, tclSafeString(tag), collectAny(items...)))
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// If item is specified, sets the focus item to item. Otherwise, returns the
+// current focus item, or {} if there is none.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) Focus(item ...any) (r string) {
+	switch len(item) {
+	case 0:
+		return evalErr(fmt.Sprintf("%s focus", w))
+	default:
+		return evalErr(fmt.Sprintf("%s focus %s", w, tclSafeString(fmt.Sprint(item[0]))))
+	}
+}
+
+// ttk::treeview — hierarchical multicolumn data display widget
+//
+// # Description
+//
+// Query or modify the options for the specified tagName. If one or more
+// option/value pairs are specified, sets the value of those options for the
+// specified tag. If a single option is specified, returns the value of that
+// option (or the empty string if the option has not been specified for
+// tagName). With no additional arguments, returns a dictionary of the option
+// settings for tagName. See TAG OPTIONS for the list of available options.
+//
+// More information might be available at the [Tcl/Tk treeview] page.
+//
+// [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
+func (w *TTreeviewWidget) TagConfigure(tag string, options ...any) (r string) {
+	if len(options) == 1 {
+		if s := funcToTclOption(options[0]); s != "" {
+			return evalErr(fmt.Sprintf("%s tag configure %s %s", w, tclSafeString(fmt.Sprint(tag)), s))
+		}
+	}
+
+	return evalErr(fmt.Sprintf("%s tag configure %s %s", w, tclSafeString(tag), collectAny(options...)))
 }
 
 // ttk::treeview — hierarchical multicolumn data display widget
@@ -6161,11 +7526,15 @@ func (w *TTreeviewWidget) Item(item any, options ...Opt) (r string) {
 //
 // [Tcl/Tk treeview]: https://tcl.tk/man/tcl9.0/TkCmd/ttk_treeview.html
 func (w *TTreeviewWidget) Selection(selop string, itemList ...any) (r []string) {
+	var s string
+	if len(itemList) != 0 {
+		s = fmt.Sprintf("{%s}", tclSafeList(flat(itemList...)...))
+	}
 	if selop == "" {
-		return parseList(evalErr(fmt.Sprintf("%s selection %s %s", w, tclSafeString(fmt.Sprint(selop)), collectAny(itemList...))))
+		return parseList(evalErr(fmt.Sprintf("%s selection %s", w, s)))
 	}
 
-	evalErr(fmt.Sprintf("%s selection %s %s", w, tclSafeString(fmt.Sprint(selop)), collectAny(itemList...)))
+	evalErr(fmt.Sprintf("%s selection %s %s", w, tclSafeString(fmt.Sprint(selop)), s))
 	return nil
 }
 
@@ -6257,4 +7626,362 @@ type OptionMenuWidget struct {
 // Name returns the menu name of 'w'.
 func (w *OptionMenuWidget) Name() string {
 	return w.name
+}
+
+// grab — Confine pointer and keyboard events to a window sub-tree
+//
+// # Description
+//
+// Same as GrabSet().
+//
+// More information might be available at the [Tcl/Tk grab] page.
+//
+// [Tcl/Tk grab]: https://tcl.tk/man/tcl9.0/TkCmd/grab.html
+func Grab(options ...Opt) {
+	GrabSet(options...)
+}
+
+// grab — Confine pointer and keyboard events to a window sub-tree
+//
+// # Description
+//
+// If window is specified, returns the name of the current grab window in this
+// application for window's display, or an empty string if there is no such
+// window. If window is omitted, the command returns a list whose elements are
+// all of the windows grabbed by this application for all displays, or an empty
+// string if the application has no grabs.
+//
+// More information might be available at the [Tcl/Tk grab] page.
+//
+// [Tcl/Tk grab]: https://tcl.tk/man/tcl9.0/TkCmd/grab.html
+func GrabCurrent(options ...Opt) []string {
+	return parseList(evalErr(fmt.Sprintf("grab current %s", collect(options...))))
+}
+
+// grab — Confine pointer and keyboard events to a window sub-tree
+//
+// # Description
+//
+// Releases the grab on window if there is one, otherwise does nothing.
+//
+// More information might be available at the [Tcl/Tk grab] page.
+//
+// [Tcl/Tk grab]: https://tcl.tk/man/tcl9.0/TkCmd/grab.html
+func GrabRelease(w Opt) {
+	evalErr(fmt.Sprintf("grab release %s", w))
+}
+
+// grab — Confine pointer and keyboard events to a window sub-tree
+//
+// # Description
+//
+// Sets a grab on window. If -global is specified then the grab is global,
+// otherwise it is local. If a grab was already in effect for this application
+// on window's display then it is automatically released. If there is already a
+// grab on window and it has the same global/local form as the requested grab,
+// then the command does nothing.
+//
+// More information might be available at the [Tcl/Tk grab] page.
+//
+// [Tcl/Tk grab]: https://tcl.tk/man/tcl9.0/TkCmd/grab.html
+func GrabSet(options ...Opt) {
+	evalErr(fmt.Sprintf("grab set %s", collect(options...)))
+}
+
+// grab — Confine pointer and keyboard events to a window sub-tree
+//
+// # Description
+//
+// Returns none if no grab is currently set on window, local if a local grab is
+// set on window, and global if a global grab is set.
+//
+// More information might be available at the [Tcl/Tk grab] page.
+//
+// [Tcl/Tk grab]: https://tcl.tk/man/tcl9.0/TkCmd/grab.html
+func GrabStatus(w Opt) string {
+	return evalErr(fmt.Sprintf("grab status %s", w))
+}
+
+// Global option.
+//
+// Known uses:
+//   - [Grab] (command specific)
+//   - [GrabSet] (command specific)
+func Global() Opt {
+	return rawOption("-global")
+}
+
+// after — Execute a command after a time delay
+//
+// # Description
+//
+// If script is not specified, the command sleeps for duration 'ms' and then
+// returns. Negative duration 'ms' is treated as zero. While the command is
+// sleeping the application does not respond to events.
+//
+// If script is specified, the command returns immediately, but it arranges for
+// a Tcl command to be executed ms milliseconds later as an event handler. The
+// command will be executed exactly once, at the given time. The command will
+// be executed at global level (outside the context of any Tcl procedure). If
+// an error occurs while executing the delayed command then the background
+// error will be reported by the command registered with interp bgerror. The
+// after command returns an identifier that can be used to cancel the delayed
+// command using after cancel. A ms value of 0 (or negative) queues the event
+// immediately with priority over other event types (if not installed withn an
+// event proc, which will wait for next round of events).
+//
+// More information might be available at the [Tcl/Tk after] page.
+//
+// [Tcl/Tk grab]: https://tcl.tk/man/tcl9.0/TkCmd/after.html
+func TclAfter(ms time.Duration, script ...any) string {
+	switch {
+	case len(script) == 0:
+		return evalErr(fmt.Sprintf("after %v", optionString(ms)))
+	default:
+		return evalErr(fmt.Sprintf("after %v %s", optionString(ms), newEventHandler("", script[0]).optionString(nil)))
+	}
+}
+
+// after — Execute a command after a time delay
+//
+// # Description
+//
+// Cancels the execution of a delayed command that was previously scheduled. Id
+// indicates which command should be canceled; it must have been the return
+// value from a previous after command. If the command given by id has already
+// been executed then the after cancel command has no effect.
+//
+// More information might be available at the [Tcl/Tk after] page.
+//
+// [Tcl/Tk grab]: https://tcl.tk/man/tcl9.0/TkCmd/after.html
+func TclAfterCancel(id string) {
+	evalErr(fmt.Sprintf("after cancel %s", tclSafeString(id)))
+}
+
+// after — Execute a command after a time delay
+//
+// # Description
+//
+// Concatenates the script arguments together with space separators (just as in
+// the concat command), and arranges for the resulting script to be evaluated
+// later as an idle callback. The script will be run exactly once, the next
+// time the event loop is entered and there are no events to process. The
+// command returns an identifier that can be used to cancel the delayed command
+// using after cancel. If an error occurs while executing the script then the
+// background error will be reported by the command registered with interp
+// bgerror.
+//
+// More information might be available at the [Tcl/Tk after] page.
+//
+// [Tcl/Tk grab]: https://tcl.tk/man/tcl9.0/TkCmd/after.html
+func TclAfterIdle(script any) string {
+	switch x := script.(type) {
+	case nil:
+		return ""
+	case *eventHandler:
+		x.tcl = ""
+		return evalErr(fmt.Sprintf("after idle %s", collect(x)))
+	default:
+		return evalErr(fmt.Sprintf("after idle %s", newEventHandler("", script).optionString(nil)))
+	}
+}
+
+// A helper for ActivateTheme/ActivateExtension.
+func isCalledFromMain() bool {
+	pcs := make([]uintptr, 20)
+	n := runtime.Callers(3, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		frame, more := frames.Next()
+		if strings.HasPrefix(frame.Function, "main.") {
+			return true
+		}
+
+		if !more {
+			return false
+		}
+	}
+}
+
+// Entry — Create and manipulate 'entry' one-line text entry widgets
+//
+// # Description
+//
+// Arrange for the insertion cursor to be displayed just before the character
+// given by index. Returns an empty string.
+//
+// More information might be available at the [Tcl/Tk entry] page.
+//
+// [Tcl/Tk entry]: https://www.tcl.tk/man/tcl9.0/TkCmd/entry.html
+func (w *EntryWidget) Icursor(index any) (r string) {
+	return evalErr(fmt.Sprintf("%s icursor %s", w, tclSafeString(fmt.Sprint(index))))
+}
+
+// TEntry — Editable text field widget
+//
+// # Description
+//
+// Arrange for the insertion cursor to be displayed just before the character
+// given by index. Returns an empty string.
+//
+// More information might be available at the [Tcl/Tk ttk_entry] page.
+//
+// [Tcl/Tk ttk_entry]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_entry.html
+func (w *TEntryWidget) Icursor(index any) (r string) {
+	return evalErr(fmt.Sprintf("%s icursor %s", w, tclSafeString(fmt.Sprint(index))))
+}
+
+// listbox — Create and manipulate 'listbox' item list widgets
+//
+// # Description
+//
+// If last is omitted, returns the contents of the listbox element indicated by
+// first, or an empty string if first refers to a non-existent element. If last
+// is specified, the command returns a list whose elements are all of the
+// listbox elements between first and last, inclusive. Both first and last may
+// have any of the standard forms for indices.
+//
+// More information might be available at the [Tcl/Tk listbox] page.
+//
+// [Tcl/Tk listbox]: https://www.tcl.tk/man/tcl9.0/TkCmd/listbox.html
+func (w *ListboxWidget) Get(first any, last ...any) (r []string) {
+	switch len(last) {
+	case 0:
+		return []string{evalErr(fmt.Sprintf("%s get %s", w, tclSafeString(fmt.Sprint(first))))}
+	default:
+		return parseList(evalErr(fmt.Sprintf("%s get %s %s", w, tclSafeString(fmt.Sprint(first)), tclSafeString(fmt.Sprint(last[0])))))
+	}
+}
+
+// listbox — Create and manipulate 'listbox' item list widgets
+//
+// # Description
+//
+// Inserts zero or more new elements in the list just before the element given
+// by index. If index is specified as end then the new elements are added to
+// the end of the list.
+//
+// More information might be available at the [Tcl/Tk listbox] page.
+//
+// [Tcl/Tk listbox]: https://www.tcl.tk/man/tcl9.0/TkCmd/listbox.html
+func (w *ListboxWidget) Insert(index any, elements ...any) {
+	evalErr(fmt.Sprintf("%s insert %s %s", w, tclSafeString(fmt.Sprint(index)), tclSafeList(elements...)))
+}
+
+// listbox — Create and manipulate 'listbox' item list widgets
+//
+// # Description
+//
+// Returns a list containing the numerical indices of all of the elements in the
+// listbox that are currently selected. If there are no elements selected in the
+// listbox then a zero length slice is returned.
+//
+// More information might be available at the [Tcl/Tk listbox] page.
+//
+// [Tcl/Tk listbox]: https://www.tcl.tk/man/tcl9.0/TkCmd/listbox.html
+func (w *ListboxWidget) Curselection() (r []int) {
+	indicesStrings := parseList(evalErr(fmt.Sprintf("%s curselection", w)))
+	indices := make([]int, len(indicesStrings))
+	for i, index := range indicesStrings {
+		indices[i] = atoi(index)
+	}
+	return indices
+}
+
+// ttk::progressbar — Provide progress feedback
+//
+// # Description
+//
+// Begin autoincrement mode: schedules a recurring timer event that calls step
+// every interval milliseconds. If omitted, interval defaults to 50
+// milliseconds (20 steps/second).
+//
+// More information might be available at the [Tcl/Tk progressbar] page.
+//
+// [Tcl/Tk progressbar]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_progressbar.html
+func (w *TProgressbarWidget) Start(interval ...time.Duration) {
+	s := ""
+	if len(interval) != 0 {
+		s = fmt.Sprint(int(interval[0] / time.Millisecond))
+	}
+	evalErr(fmt.Sprintf("%s start %s", w, s))
+}
+
+// ttk::progressbar — Provide progress feedback
+//
+// # Description
+//
+// Increments the -value by amount. amount defaults to 1.0 if omitted.
+//
+// More information might be available at the [Tcl/Tk progressbar] page.
+//
+// [Tcl/Tk progressbar]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_progressbar.html
+func (w *TProgressbarWidget) Step(amount ...float64) {
+	s := ""
+	if len(amount) != 0 {
+		s = fmt.Sprint(amount[0])
+	}
+	evalErr(fmt.Sprintf("%s step %s", w, s))
+}
+
+// ttk::progressbar — Provide progress feedback
+//
+// # Description
+//
+// Stop autoincrement mode: cancels any recurring timer event initiated by
+// pathName start.
+//
+// More information might be available at the [Tcl/Tk progressbar] page.
+//
+// [Tcl/Tk progressbar]: https://www.tcl.tk/man/tcl9.0/TkCmd/ttk_progressbar.html
+func (w *TProgressbarWidget) Stop() {
+	evalErr(fmt.Sprintf("%s stop", w))
+}
+
+func goString(p uintptr) string { // Result can be retained.
+	if p == 0 {
+		return ""
+	}
+
+	p0 := p
+	var n int
+	for ; *(*byte)(unsafe.Pointer(p)) != 0; n++ {
+		p++
+	}
+	if n != 0 {
+		return string(unsafe.Slice((*byte)(unsafe.Pointer(p0)), n))
+	}
+
+	return ""
+}
+
+// Values option.
+//
+// Known uses:
+//   - [Spinbox] (widget specific)
+//   - [TCombobox] (widget specific)
+//   - [TSpinbox] (widget specific)
+func Values(val any) Opt {
+	switch x := val.(type) {
+	case []string:
+		return rawOption(fmt.Sprintf(`-values {%s}`, tclSafeStrings(x...)))
+	case []any:
+		return rawOption(fmt.Sprintf(`-values {%s}`, tclSafeList(x...)))
+	default:
+		return rawOption(fmt.Sprintf(`-values %s`, optionString(val)))
+	}
+}
+
+// Uniform option.
+//
+// Known uses:
+//   - [GridColumnConfigure] (command specific)
+//   - [GridRowConfigure] (command specific)
+//
+// More information might be available at the [Tcl/Tk grid] page.
+//
+// [Tcl/Tk grid]: https://www.tcl-lang.org/man/tcl9.0/TkCmd/grid.html#M8
+func Uniform(val any) Opt {
+	// Credit: Complex_Signal2842, https://www.reddit.com/r/golang/comments/1jcpp3d/comment/mja2l9s/?context=3
+	return rawOption(fmt.Sprintf(`-uniform %s`, tclSafeString(fmt.Sprint(val))))
 }

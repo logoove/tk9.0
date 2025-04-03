@@ -1,6 +1,7 @@
 package main
 
 import . "modernc.org/tk9.0"
+import _ "modernc.org/tk9.0/themes/azure"
 
 // https://gnuplot.sourceforge.net/demo_5.4/hidden2.html
 const script = `
@@ -36,5 +37,6 @@ func main() {
 	Pack(Label(Image(NewPhoto(Width(20*cm), Height(15*cm)).Graph(script))),
 		TExit(),
 		Padx("1m"), Pady("2m"), Ipadx("1m"), Ipady("1m"))
+	ActivateTheme("azure light")
 	App.Center().Wait()
 }

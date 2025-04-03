@@ -26,8 +26,51 @@ var (
 	currentThemeKey ThemeKey
 
 	_ Theme        = (*theme)(nil)
+	_ Theme        = (*builtinTheme)(nil)
 	_ ThemeContext = themeContext{}
 )
+
+// https://tkdocs.com/tutorial/styles.html
+//
+// Besides the built-in themes (alt, default, clam, and classic), macOS
+// includes a theme named aqua to match the system-wide style, while Windows
+// includes themes named vista, winxpnative, and winnative.
+func init() {
+	RegisterTheme("alt", &builtinTheme{"alt"})
+	RegisterTheme("default", &builtinTheme{"default"})
+	RegisterTheme("clam", &builtinTheme{"clam"})
+	RegisterTheme("classic", &builtinTheme{"classic"})
+	switch goos {
+	case "darwin":
+		RegisterTheme("aqua", &builtinTheme{"aqua"})
+	case "windows":
+		RegisterTheme("vista", &builtinTheme{"vista"})
+		RegisterTheme("winxpnative", &builtinTheme{"winxpnative"})
+		RegisterTheme("winnative", &builtinTheme{"winnative"})
+	}
+}
+
+type builtinTheme struct {
+	name string
+}
+
+func (t *builtinTheme) Activate(context ThemeContext) error {
+	StyleThemeUse(t.name)
+	return nil
+}
+
+func (t *builtinTheme) Deactivate(context ThemeContext) error {
+	StyleThemeUse("default")
+	return nil
+}
+
+func (t *builtinTheme) Finalize(context ThemeContext) error {
+	return nil
+}
+
+func (t *builtinTheme) Initialize(context ThemeContext) error {
+	return nil
+}
 
 // CurrentTheme returns the currently activated theme, if any.
 func CurrentTheme() Theme {
@@ -43,7 +86,14 @@ func CurrentThemeName() (r string) {
 // call its Activate method. The search is case insensitive, using
 // strings.ToLower, and white space is normalized. If there's no match,
 // ActivateTheme returns [NotFound].
+//
+// Any package can register themes but only the main package can activate a
+// theme.
 func ActivateTheme(name string) (err error) {
+	if !isCalledFromMain() {
+		return NotActivated
+	}
+
 	var keys []ThemeKey
 	for k := range Themes {
 		keys = append(keys, k)
@@ -66,7 +116,7 @@ func ActivateTheme(name string) (err error) {
 			return Themes[k].Activate(nil)
 		}
 	}
-	return NotActivated
+	return NotFound
 }
 
 func matchName(s string) string {
@@ -231,7 +281,7 @@ func (t *theme) Initialize(context ThemeContext) (err error) {
 	return err
 }
 
-func typeName(th Theme) string {
+func typeName(th any) string {
 	t := reflect.TypeOf(th)
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()

@@ -1,0 +1,8 @@
+175c175
+< #     define PNG_POWERPC_VSX_OPT 2
+---
+> #     define PNG_POWERPC_VSX_OPT 0
+183c183
+< #     define PNG_LOONGARCH_LSX_OPT 1
+---
+> #     define PNG_LOONGARCH_LSX_OPT 0

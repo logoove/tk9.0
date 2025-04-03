@@ -3617,48 +3617,6 @@ type TMenubuttonWidget struct {
 // (not including internal padding).
 // Otherwise, the maximum width of all panes is used.
 //
-// [State]
-//
-// Either normal, disabled or hidden.
-// If disabled, then the tab is not selectable.
-// If hidden, then the tab is not shown.
-//
-// [Sticky]
-//
-// Specifies how the content window is positioned within the pane area.
-// Value is a string containing zero or more of the characters
-// n, s, e, or w.
-// Each letter refers to a side (north, south, east, or west)
-// that the content window will
-// to, as per the grid geometry manager.
-//
-// [Padding]
-//
-// Specifies the amount of extra space to add between the notebook and this pane.
-// Syntax is the same as for the widget -padding option.
-//
-// [Txt]
-//
-// Specifies a string to be displayed in the tab.
-//
-// [Image]
-//
-// Specifies an image to display in the tab.
-// See ttk_widget(n) for details.
-//
-// [Compound]
-//
-// Specifies how to display the image relative to the text,
-// in the case both -text and -image are present.
-// See label(n) for legal values.
-//
-// [Underline]
-//
-// Specifies the integer index (0-based) of a character to underline
-// in the text string.
-// The underlined character is used for mnemonic activation
-// if ttk::notebook::enableTraversal is called.
-//
 // # Styling options
 //
 // The class name for a ttk::notebook is TNotebook.  The tab has
@@ -3752,12 +3710,6 @@ type TNotebookWidget struct {
 // specifies the desired height of the widget in pixels.
 // Otherwise, the requested height is determined by the height
 // of the managed windows.
-//
-// [Weight]
-//
-// An integer specifying the relative stretchability of the pane.
-// When the paned window is resized, the extra space is added
-// or subtracted to each pane proportionally to its -weight.
 //
 // # Styling options
 //
@@ -5303,7 +5255,6 @@ func Command(handler any) Opt {
 //   - [TCheckbutton]
 //   - [TLabel]
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TRadiobutton]
 func Compound(val any) Opt {
 	return rawOption(fmt.Sprintf(`-compound %s`, optionString(val)))
@@ -5321,7 +5272,6 @@ func Compound(val any) Opt {
 //   - [TCheckbutton]
 //   - [TLabel]
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TRadiobutton]
 func (w *Window) Compound() string {
 	return evalErr(fmt.Sprintf(`%s cget -compound`, w))
@@ -6106,7 +6056,6 @@ func Icon(val any) Opt {
 //   - [TCheckbutton]
 //   - [TLabel]
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TRadiobutton]
 func Image(val any) Opt {
 	return rawOption(fmt.Sprintf(`-image %s`, optionString(val)))
@@ -6124,7 +6073,6 @@ func Image(val any) Opt {
 //   - [TCheckbutton]
 //   - [TLabel]
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TRadiobutton]
 func (w *Window) Image() string {
 	return evalErr(fmt.Sprintf(`%s cget -image`, w))
@@ -7885,7 +7833,6 @@ func (w *Window) Startline() string {
 //   - [TEntry] (widget specific)
 //   - [TLabel]
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TRadiobutton]
 //   - [TSpinbox]
 //   - [Text] (widget specific)
@@ -7912,7 +7859,6 @@ func State(val any) Opt {
 //   - [TEntry] (widget specific)
 //   - [TLabel]
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TRadiobutton]
 //   - [TSpinbox]
 //   - [Text] (widget specific)
@@ -7924,17 +7870,8 @@ func (w *Window) State() string {
 //
 // Known uses:
 //   - [Grid] (command specific)
-//   - [TNotebook] (widget specific)
 func Sticky(val any) Opt {
 	return rawOption(fmt.Sprintf(`-sticky %s`, optionString(val)))
-}
-
-// Sticky — Get the configured option value.
-//
-// Known uses:
-//   - [TNotebook] (widget specific)
-func (w *Window) Sticky() string {
-	return evalErr(fmt.Sprintf(`%s cget -sticky`, w))
 }
 
 // Striped option.
@@ -8194,7 +8131,6 @@ func Tearoffcommand(handler any) Opt {
 //   - [TLabel]
 //   - [TLabelframe] (widget specific)
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TProgressbar]
 //   - [TRadiobutton]
 func Txt(val any) Opt {
@@ -8216,7 +8152,6 @@ func Txt(val any) Opt {
 //   - [TLabel]
 //   - [TLabelframe] (widget specific)
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TProgressbar]
 //   - [TRadiobutton]
 func (w *Window) Txt() string {
@@ -8369,25 +8304,6 @@ func (w *Window) Troughcolor() string {
 	return evalErr(fmt.Sprintf(`%s cget -troughcolor`, w))
 }
 
-// Type option.
-//
-// Known uses:
-//   - [ClipboardAppend] (command specific)
-//   - [ClipboardGet] (command specific)
-//   - [Menu] (widget specific)
-//   - [MessageBox] (command specific)
-func Type(val any) Opt {
-	return rawOption(fmt.Sprintf(`-type %s`, optionString(val)))
-}
-
-// Type — Get the configured option value.
-//
-// Known uses:
-//   - [Menu] (widget specific)
-func (w *Window) Type() string {
-	return evalErr(fmt.Sprintf(`%s cget -type`, w))
-}
-
 // Underline option.
 //
 // Specifies the integer index of a character to underline in the widget.
@@ -8412,7 +8328,6 @@ func (w *Window) Type() string {
 //   - [TLabel]
 //   - [TLabelframe] (widget specific)
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TRadiobutton]
 //   - [TextWidget.TagConfigure] (command specific)
 func Underline(val any) Opt {
@@ -8432,7 +8347,6 @@ func Underline(val any) Opt {
 //   - [TLabel]
 //   - [TLabelframe] (widget specific)
 //   - [TMenubutton]
-//   - [TNotebook] (widget specific)
 //   - [TRadiobutton]
 func (w *Window) Underline() string {
 	return evalErr(fmt.Sprintf(`%s cget -underline`, w))
@@ -8540,26 +8454,6 @@ func (w *Window) Value() string {
 	return evalErr(fmt.Sprintf(`%s cget -value`, w))
 }
 
-// Values option.
-//
-// Known uses:
-//   - [Spinbox] (widget specific)
-//   - [TCombobox] (widget specific)
-//   - [TSpinbox] (widget specific)
-func Values(val any) Opt {
-	return rawOption(fmt.Sprintf(`-values %s`, optionString(val)))
-}
-
-// Values — Get the configured option value.
-//
-// Known uses:
-//   - [Spinbox] (widget specific)
-//   - [TCombobox] (widget specific)
-//   - [TSpinbox] (widget specific)
-func (w *Window) Values() string {
-	return evalErr(fmt.Sprintf(`%s cget -values`, w))
-}
-
 // Visual option.
 //
 // Known uses:
@@ -8584,17 +8478,8 @@ func (w *Window) Visual() string {
 //
 // Known uses:
 //   - [NewFont] (command specific)
-//   - [TPanedwindow] (widget specific)
 func Weight(val any) Opt {
 	return rawOption(fmt.Sprintf(`-weight %s`, optionString(val)))
-}
-
-// Weight — Get the configured option value.
-//
-// Known uses:
-//   - [TPanedwindow] (widget specific)
-func (w *Window) Weight() string {
-	return evalErr(fmt.Sprintf(`%s cget -weight`, w))
 }
 
 // Width option.

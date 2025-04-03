@@ -1,6 +1,6 @@
 {
 	"autogen": "<none>",
-	"autotag": "darwin/(amd64|arm64)|linux/(amd64|arm64|loong64|ppc64le|s390x|386|arm|riscv64)|freebsd/(amd64|arm64)|windows/(amd64|arm64|386)",
-	"autoupdate": "darwin/(amd64|arm64)|linux/(amd64|arm64|loong64|ppc64le|s390x|386|arm|riscv64)|freebsd/(amd64|arm64)|windows/(amd64|arm64|386)",
+	"autotag": ".",
+	"autoupdate": ".",
 	"test": "darwin/(amd64|arm64)|linux/(amd64|arm64|loong64|ppc64le|s390x|386|arm|riscv64)|freebsd/(amd64|arm64)|windows/(amd64|arm64|386)"
 }

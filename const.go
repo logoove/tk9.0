@@ -6,6 +6,7 @@ package tk9_0 // import "modernc.org/tk9.0"
 
 import (
 	"fmt"
+	"strings"
 )
 
 type cursor string
@@ -954,3 +955,139 @@ const (
 	SystemHighlight  = "systemHighlight"
 	SystemMenu       = "systemMenu"
 )
+
+// Default generic font names
+const (
+	DefaultFont      = "TkDefaultFont"      // Default for items not otherwise specified.
+	TextFont         = "TkTextFont"         // Used for entry widgets, listboxes, etc.
+	FixedFont        = "TkFixedFont"        // A standard fixed-width font.
+	MenuFont         = "TkMenuFont"         // The font used for menu items.
+	HeadingFont      = "TkHeadingFont"      // Font for column headings in lists and tables.
+	CaptionFont      = "TkCaptionFont"      // A font for window and dialog caption bars.
+	SmallCaptionFont = "TkSmallCaptionFont" // A smaller caption font for tool dialogs.
+	IconFont         = "TkIconFont"         // A font for icon captions.
+	TooltipFont      = "TkTooltipFont"      // A font for tooltips.
+)
+
+// Common Tk-specific words.
+//
+// Although Go's style guide recommends MixedCase, these are all in ALL_CAPS
+// to avoid namespace collisions. For the pack fill options a prefix is used
+// to avoid colliding with the X() and Y() option functions.
+//
+// See https://gitlab.com/cznic/tk9.0/-/issues/25
+const (
+	// Font attributes
+	NORMAL     = "normal"
+	BOLD       = "bold"
+	ITALIC     = "italic"
+	ROMAN      = "roman"
+	UNDERLINE  = "underline"
+	OVERSTRIKE = "overstrike"
+	// Common font names (for Courier use the CourierFont() function)
+	HELVETICA = "helvetica"
+	TIMES     = "times"
+	// Text justify attributes (also used in other contexts)
+	CENTER = "center" // also used as an anchor
+	LEFT   = "left"   // also used as a pack side option
+	RIGHT  = "right"  // also used as a pack side option
+	// Text wrapping
+	NONE = "none" // Also used as a Treeview select mode
+	CHAR = "char"
+	WORD = "word"
+	// Text end position
+	END = "end"
+	// MessageBox icon names
+	INFO     = "info"
+	QUESTION = "question"
+	WARNING  = "warning"
+	ERROR    = "error"
+	// Anchor and sticky options (CENTER is also an anchor option)
+	N    = "n"
+	S    = "s"
+	W    = "w"
+	E    = "e"
+	NEWS = "nswe"
+	WE   = "we"
+	NS   = "ns"
+	// Pack fill options
+	FILL_X    = "x"
+	FILL_Y    = "y"
+	FILL_BOTH = "both"
+	// Pack side options (can also use LEFT and RIGHT)
+	TOP    = "top"
+	BOTTOM = "bottom"
+	// Orientation (e.g., for TPanedWindow)
+	VERTICAL   = "vertical"
+	HORIZONTAL = "horizontal"
+	// Select mode
+	EXTENDED = "extended"
+	BROWSE   = "browse"
+	// Select type
+	CELL = "cell"
+	ITEM = "item"
+	// Relief
+	FLAT   = "flat"
+	GROOVE = "groove"
+	RAISED = "raised"
+	RIDGE  = "ridge"
+	SOLID  = "solid"
+	SUNKEN = "sunken"
+	// Window Manager protocols
+	WM_TAKE_FOCUS    = "WM_TAKE_FOCUS"
+	WM_DELETE_WINDOW = "WM_DELETE_WINDOW"
+)
+
+// Modifier is a bit field representing 0 or more modifiers.
+type Modifier int
+
+func (mods Modifier) String() string {
+	var names []string
+	for _, mod := range modifierNames {
+		if mods&mod.modifier == mod.modifier {
+			names = append(names, mod.name)
+		}
+	}
+	return strings.Join(names, "+")
+}
+
+const (
+	ModifierNone  Modifier = 0
+	ModifierShift Modifier = 1 << (iota - 1)
+	ModifierLock
+	ModifierControl
+	ModifierMod1
+	ModifierMod2
+	ModifierMod3
+	ModifierMod4
+	ModifierMod5
+	ModifierButton1
+	ModifierButton2
+	ModifierButton3
+	ModifierButton4
+	ModifierButton5
+
+	ModifierAlt     = ModifierMod1
+	ModifierNumlock = ModifierMod2
+	ModifierWindows = ModifierMod4
+	ModifierSuper   = ModifierMod4
+)
+
+var modifierNames = []struct {
+	modifier Modifier
+	name     string
+}{
+	{ModifierShift, "Shift"},
+	{ModifierLock, "Lock"},
+	{ModifierControl, "Control"},
+	{ModifierMod1, "Mod1"},
+	{ModifierMod2, "Mod2"},
+	{ModifierMod3, "Mod3"},
+	{ModifierMod4, "Mod4"},
+	{ModifierMod5, "Mod5"},
+	{ModifierButton1, "Button1"},
+	{ModifierButton2, "Button2"},
+	{ModifierButton3, "Button3"},
+	{ModifierButton4, "Button4"},
+	{ModifierButton5, "Button5"},
+}
